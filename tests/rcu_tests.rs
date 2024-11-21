@@ -1,7 +1,6 @@
 use read_copy_update::Rcu;
 use std::thread;
 
-// マクロを使用するためにクレート全体をインポート
 use read_copy_update::define_rcu;
 
 // Define a static RCU instance for i32 with an initial value of 42.
