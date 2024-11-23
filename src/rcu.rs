@@ -144,12 +144,9 @@ impl<T> Rcu<T> {
         F: Fn(&T) -> T,
     {
         loop {
-            // Enter a read-side critical section.
-            rcu_read_lock();
             let old_ptr = self.ptr.load(Ordering::SeqCst);
             if old_ptr.is_null() {
                 // If the pointer is null, exit the critical section and return an error.
-                rcu_read_unlock();
                 return Err(());
             }
             let new_data = unsafe {
@@ -166,15 +163,9 @@ impl<T> Rcu<T> {
                 .compare_exchange(old_ptr, new_ptr, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
-                    // Exit the read-side critical section.
-                    rcu_read_unlock();
-
                     return Ok(());
                 }
                 Err(_) => {
-                    // Exit the read-side critical section.
-                    rcu_read_unlock();
-
                     // If the CAS operation failed, deallocate the new data and retry.
                     unsafe {
                         let _ = Box::from_raw(new_ptr);
