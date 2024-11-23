@@ -1,7 +1,14 @@
 use crate::thread_data::{rcu_dereference, rcu_read_lock, rcu_read_unlock};
 use std::ptr;
-use std::sync::atomic::AtomicPtr;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicPtr, Ordering};
+
+/// Represents a callback structure.
+/// Each callback holds a function pointer and a data pointer.
+struct Callback<T> {
+    func: fn(*mut T),
+    data: *mut T,
+    next: AtomicPtr<Callback<T>>,
+}
 
 /// RCU-protected pointer structure.
 /// Manages concurrent reads and updates without using traditional locking mechanisms.
@@ -36,6 +43,7 @@ use std::sync::atomic::Ordering;
 /// ```
 pub struct Rcu<T> {
     ptr: AtomicPtr<T>,
+    callbacks: AtomicPtr<Callback<T>>,
 }
 
 impl<T> Rcu<T> {
@@ -52,6 +60,7 @@ impl<T> Rcu<T> {
         let boxed = Box::new(data);
         Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
+            callbacks: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -68,6 +77,7 @@ impl<T> Rcu<T> {
     pub const fn new_static() -> Self {
         Rcu {
             ptr: AtomicPtr::new(ptr::null_mut()),
+            callbacks: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -149,11 +159,8 @@ impl<T> Rcu<T> {
                 // If the pointer is null, exit the critical section and return an error.
                 return Err(());
             }
-            let new_data = unsafe {
-                // Generate the new data based on the current data.
-                f(&*old_ptr)
-            };
-
+            // Generate the new data based on the current data.
+            let new_data = unsafe { f(&*old_ptr) };
             let new_box = Box::new(new_data);
             let new_ptr = Box::into_raw(new_box);
 
@@ -163,23 +170,59 @@ impl<T> Rcu<T> {
                 .compare_exchange(old_ptr, new_ptr, Ordering::SeqCst, Ordering::SeqCst)
             {
                 Ok(_) => {
+                    self.add_callback(free_callback, old_ptr);
                     return Ok(());
                 }
                 Err(_) => {
                     // If the CAS operation failed, deallocate the new data and retry.
-                    unsafe {
-                        let _ = Box::from_raw(new_ptr);
-                    }
+                    unsafe { drop(Box::from_raw(new_ptr)) };
                     // Continue the loop to retry the update.
                     continue;
                 }
             }
         }
     }
+
+    /// Adds a callback to the callback list.
+    fn add_callback(&self, func: fn(*mut T), data: *mut T) {
+        let cb = Box::new(Callback {
+            func,
+            data,
+            next: AtomicPtr::new(ptr::null_mut()),
+        });
+        let cb_ptr = Box::into_raw(cb);
+
+        loop {
+            let head = self.callbacks.load(Ordering::Acquire);
+            unsafe {
+                (*cb_ptr).next.store(head, Ordering::Relaxed);
+            }
+            if self
+                .callbacks
+                .compare_exchange(head, cb_ptr, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break;
+            }
+        }
+    }
+
+    /// Processes all pending callbacks and executes them.
+    pub fn process_callbacks(&self) {
+        let mut cb_ptr = self.callbacks.swap(ptr::null_mut(), Ordering::AcqRel);
+        while !cb_ptr.is_null() {
+            unsafe {
+                let cb = Box::from_raw(cb_ptr);
+                (cb.func)(cb.data);
+                cb_ptr = cb.next.load(Ordering::Acquire);
+            }
+        }
+    }
 }
 
-// impl<T> Drop for Rcu<T> {
-//     fn drop(&mut self) {
-//         // TODO: Implement Quiescent State-Based Reclamation (QSBR) for safe memory reclamation.
-//     }
-// }
+/// Callback function to free old data.
+fn free_callback<T>(ptr: *mut T) {
+    unsafe {
+        drop(Box::from_raw(ptr));
+    }
+}

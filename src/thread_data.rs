@@ -1,3 +1,4 @@
+use crate::Rcu;
 use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
@@ -104,6 +105,11 @@ pub fn synchronize_rcu() {
             thread::yield_now();
         }
     }
+}
+
+pub fn call_rcu<T>(rcu: &Rcu<T>) {
+    synchronize_rcu();
+    rcu.process_callbacks();
 }
 
 /// Safely assigns a new value to an RCU-protected atomic pointer.
