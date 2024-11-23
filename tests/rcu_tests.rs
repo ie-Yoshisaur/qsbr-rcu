@@ -1,10 +1,6 @@
 use read_copy_update::{call_rcu, define_rcu, synchronize_rcu, Rcu};
 use std::thread;
 
-// Define a static RCU instance for i32 with an initial value of 42.
-define_rcu!(RCU_TEST_MULTI, get_rcu_test_multi, i32, 42);
-define_rcu!(RCU_TEST_CALLBACK, get_rcu_test_callback, i32, 42);
-
 /// Increment the value stored in the RCU instance.
 /// Uses `try_update` to safely perform the update.
 fn increment_rcu_value(rcu: &Rcu<i32>) {
@@ -22,6 +18,8 @@ fn simulate_read(rcu: &Rcu<i32>, iterations: usize) {
 
 #[test]
 fn test_rcu_multithreaded_update_and_callback() {
+    // Define a static RCU instance for i32 with an initial value of 42.
+    define_rcu!(RCU_TEST_MULTI, get_rcu_test_multi, i32, 42);
     let rcu = get_rcu_test_multi();
 
     // Define the number of threads and the number of increments each thread will perform.
@@ -68,6 +66,8 @@ fn test_rcu_multithreaded_update_and_callback() {
 
 #[test]
 fn test_rcu_callback_processing() {
+    // Define a static RCU instance for i32 with an initial value of 42.
+    define_rcu!(RCU_TEST_CALLBACK, get_rcu_test_callback, i32, 42);
     let rcu = get_rcu_test_callback();
 
     for _ in 0..10 {
