@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 use std::thread;
 
 /// Thread-specific data structure used to track the state of each thread.
-pub struct ThreadData {
+struct ThreadData {
     /// Pointer to the next ThreadData in the global list.
     next: AtomicPtr<ThreadData>,
     /// Indicates whether the thread is currently registered.
@@ -15,7 +15,7 @@ pub struct ThreadData {
 
 impl ThreadData {
     /// Creates a new ThreadData instance with default values.
-    pub fn new() -> Self {
+    fn new() -> Self {
         ThreadData {
             next: AtomicPtr::new(ptr::null_mut()),
             registered: AtomicBool::new(false),
@@ -23,12 +23,6 @@ impl ThreadData {
         }
     }
 }
-
-// impl Drop for ThreadData {
-//     fn drop(&mut self) {
-//         // TODO: Implement thread unregistration.
-//     }
-// }
 
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
@@ -57,7 +51,23 @@ fn register_thread(td: &'static ThreadData) {
 }
 
 /// Marks the beginning of an RCU read-side critical section.
-/// This function sets the `in_critical` flag to true for the current thread.
+///
+/// This function ensures that the current thread's operations on RCU-protected
+/// data are safely marked as "in progress", preventing the reclamation of data.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::rcu_read_lock;
+///
+/// // Begin the critical section.
+/// rcu_read_lock();
+///
+/// // Access RCU-protected data safely here.
+///
+/// // End the critical section.
+/// read_copy_update::rcu_read_unlock();
+/// ```
 pub fn rcu_read_lock() {
     THREAD_DATA.with(|td| {
         td.in_critical.store(true, Ordering::SeqCst);
@@ -67,7 +77,23 @@ pub fn rcu_read_lock() {
 }
 
 /// Marks the end of an RCU read-side critical section.
-/// This function clears the `in_critical` flag for the current thread.
+///
+/// This function clears the flag indicating that the current thread is within
+/// a critical section, allowing reclamation of outdated RCU data.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::{rcu_read_lock, rcu_read_unlock};
+///
+/// // Enter a critical section.
+/// rcu_read_lock();
+///
+/// // Perform operations on RCU-protected data here.
+///
+/// // Exit the critical section.
+/// rcu_read_unlock();
+/// ```
 pub fn rcu_read_unlock() {
     THREAD_DATA.with(|td| {
         // Ensure memory ordering before releasing the critical section.
@@ -77,7 +103,27 @@ pub fn rcu_read_unlock() {
 }
 
 /// Waits until all ongoing RCU read-side critical sections have completed.
-/// This ensures that any data being updated can be safely reclaimed.
+///
+/// This function ensures that all threads currently accessing RCU-protected
+/// data complete their operations before proceeding.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::{rcu_read_lock, rcu_read_unlock, synchronize_rcu};
+/// use std::thread;
+///
+/// thread::spawn(|| {
+///     rcu_read_lock();
+///     // Simulate some read operations.
+///     std::thread::sleep(std::time::Duration::from_millis(100));
+///     rcu_read_unlock();
+/// });
+///
+/// // Ensure all threads finish their critical sections before proceeding.
+/// synchronize_rcu();
+/// println!("All critical sections completed.");
+/// ```
 pub fn synchronize_rcu() {
     loop {
         let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
@@ -107,13 +153,32 @@ pub fn synchronize_rcu() {
     }
 }
 
+/// Processes all pending callbacks for outdated RCU data after ensuring
+/// that all ongoing RCU read-side critical sections have completed.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::{define_rcu, Rcu, call_rcu};
+///
+/// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
+/// let rcu = get_rcu_int();
+///
+/// // Update data and ensure safe reclamation.
+/// rcu.try_update(|val| val + 1).unwrap();
+///
+/// // Process callbacks to safely clean up outdated data.
+/// call_rcu(&rcu);
+/// ```
 pub fn call_rcu<T>(rcu: &Rcu<T>) {
     synchronize_rcu();
     rcu.process_callbacks();
 }
 
 /// Safely assigns a new value to an RCU-protected atomic pointer.
-/// Ensures memory ordering to make the update visible to other threads.
+///
+/// This function ensures that the update is visible to other threads while
+/// maintaining proper memory ordering.
 ///
 /// # Examples
 ///
@@ -124,7 +189,11 @@ pub fn call_rcu<T>(rcu: &Rcu<T>) {
 ///
 /// let atomic_ptr = AtomicPtr::new(ptr::null_mut());
 /// let new_ptr = Box::into_raw(Box::new(42));
+///
+/// // Safely assign the new pointer value.
 /// rcu_assign_pointer(&atomic_ptr, new_ptr);
+///
+/// // Ensure the old pointer is reclaimed appropriately.
 /// ```
 pub fn rcu_assign_pointer<T>(p: &AtomicPtr<T>, v: *mut T) {
     // Ensure all previous writes are completed before assigning the new pointer.
@@ -133,17 +202,22 @@ pub fn rcu_assign_pointer<T>(p: &AtomicPtr<T>, v: *mut T) {
 }
 
 /// Safely dereferences an RCU-protected atomic pointer.
-/// Ensures memory ordering to make sure the read is consistent.
+///
+/// This function ensures that the read is consistent and follows proper
+/// memory ordering rules.
 ///
 /// # Examples
 ///
 /// ```rust
 /// use std::sync::atomic::AtomicPtr;
-/// use crate::read_copy_update::rcu_dereference;
+/// use read_copy_update::rcu_dereference;
 ///
+/// // Create an atomic pointer to manage RCU-protected data.
 /// let atomic_ptr = AtomicPtr::new(Box::into_raw(Box::new(42)));
+///
+/// // Safely dereference the pointer.
 /// let ptr = rcu_dereference(&atomic_ptr);
-/// assert!(!ptr.is_null());
+///
 /// unsafe {
 ///     assert_eq!(*ptr, 42);
 /// }

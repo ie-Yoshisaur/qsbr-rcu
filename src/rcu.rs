@@ -2,16 +2,23 @@ use crate::thread_data::{rcu_dereference, rcu_read_lock, rcu_read_unlock};
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, Ordering};
 
-/// Represents a callback structure.
-/// Each callback holds a function pointer and a data pointer.
+/// Represents a callback structure used for deferred cleanup in RCU.
+/// Each callback contains a function pointer (`func`) and associated data (`data`) to be processed later.
+///
+/// `Callback` forms a linked list through the `next` field, enabling multiple callbacks to be queued.
 struct Callback<T> {
-    func: fn(*mut T),
-    data: *mut T,
-    next: AtomicPtr<Callback<T>>,
+    func: fn(*mut T),             // Function to process or free the data.
+    data: *mut T,                 // Pointer to the associated data.
+    next: AtomicPtr<Callback<T>>, // Pointer to the next callback in the queue.
 }
 
-/// RCU-protected pointer structure.
-/// Manages concurrent reads and updates without using traditional locking mechanisms.
+/// A lock-free synchronization structure based on Read-Copy-Update (RCU).
+///
+/// RCU allows readers to access shared data without blocking, while writers perform updates by
+/// creating new versions of the data and replacing the old pointer atomically. Readers are guaranteed
+/// to see either the old or the new version of the data.
+///
+/// This implementation also supports deferred cleanup of old data through callbacks.
 ///
 /// # Examples
 ///
@@ -19,22 +26,20 @@ struct Callback<T> {
 /// use std::thread;
 /// use read_copy_update::{define_rcu, Rcu};
 ///
+/// // Define an RCU instance with initial value 42.
 /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
 /// let rcu = get_rcu_int();
 ///
-/// // Reader thread
+/// // Reader thread accesses the current value.
 /// let reader = thread::spawn(move || {
-///     match rcu.read(|val| {
+///     rcu.read(|val| {
 ///         println!("Read value: {}", val);
-///     }) {
-///         Ok(_) => (),
-///         Err(_) => println!("Failed to read value."),
-///     }
+///     }).expect("Failed to read value");
 /// });
 ///
-/// // Updater thread
+/// // Updater thread increments the value.
 /// let updater = thread::spawn(move || {
-///     rcu.try_update(|val| val + 1).unwrap();
+///     rcu.try_update(|val| val + 1).expect("Update failed");
 ///     println!("Value incremented.");
 /// });
 ///
@@ -42,19 +47,21 @@ struct Callback<T> {
 /// updater.join().unwrap();
 /// ```
 pub struct Rcu<T> {
-    ptr: AtomicPtr<T>,
-    callbacks: AtomicPtr<Callback<T>>,
+    ptr: AtomicPtr<T>, // Atomic pointer to the currently accessible data.
+    callbacks: AtomicPtr<Callback<T>>, // Atomic pointer to the callback list for deferred cleanup.
 }
 
 impl<T> Rcu<T> {
     /// Creates a new RCU instance by allocating the provided data on the heap.
+    ///
+    /// This method ensures that the data is managed in a way compatible with RCU's requirements.
     ///
     /// # Examples
     ///
     /// ```rust
     /// use read_copy_update::Rcu;
     ///
-    /// let rcu = Rcu::new(42);
+    /// let rcu = Rcu::new(42); // Initialize RCU with the value 42.
     /// ```
     pub fn new(data: T) -> Self {
         let boxed = Box::new(data);
@@ -64,8 +71,9 @@ impl<T> Rcu<T> {
         }
     }
 
-    /// Creates a new static RCU instance with a null pointer.
-    /// This can be initialized later with actual data.
+    /// Creates a new static RCU instance with an uninitialized state.
+    ///
+    /// Use `initialize` to set its value later.
     ///
     /// # Examples
     ///
@@ -73,6 +81,7 @@ impl<T> Rcu<T> {
     /// use read_copy_update::Rcu;
     ///
     /// let rcu = Rcu::<i32>::new_static();
+    /// rcu.initialize(100); // Assign a value to the RCU instance.
     /// ```
     pub const fn new_static() -> Self {
         Rcu {
@@ -82,7 +91,7 @@ impl<T> Rcu<T> {
     }
 
     /// Initializes a static RCU instance with the provided data.
-    /// Allocates the data on the heap and assigns it to the atomic pointer.
+    /// This operation is safe only if the RCU instance was created using `new_static`.
     ///
     /// # Examples
     ///
@@ -90,55 +99,17 @@ impl<T> Rcu<T> {
     /// use read_copy_update::Rcu;
     ///
     /// let rcu = Rcu::new_static();
-    /// rcu.initialize(100);
+    /// rcu.initialize(42); // Set initial value.
     /// ```
     pub fn initialize(&self, data: T) {
         let boxed = Box::new(data);
         self.ptr.store(Box::into_raw(boxed), Ordering::SeqCst);
     }
 
-    /// Reads the data protected by RCU within a read-side critical section.
-    /// The provided closure `f` is executed with a reference to the data.
-    /// Returns `Ok` with the result of the closure if successful, or `Err` if the pointer was null.
+    /// Reads the data protected by RCU in a read-side critical section.
     ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use read_copy_update::{Rcu, define_rcu};
-    ///
-    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-    /// let rcu = get_rcu_int();
-    ///
-    /// match rcu.read(|val| *val) {
-    ///     Ok(value) => println!("Value: {}", value),
-    ///     Err(_) => println!("Failed to read value."),
-    /// }
-    /// ```
-    pub fn read<F, R>(&self, f: F) -> Result<R, ()>
-    where
-        F: FnOnce(&T) -> R,
-    {
-        // Enter a read-side critical section.
-        rcu_read_lock();
-        let ptr = rcu_dereference(&self.ptr);
-        let result = unsafe {
-            if ptr.is_null() {
-                // If the pointer is null, exit the critical section and return an error.
-                rcu_read_unlock();
-                return Err(());
-            }
-            // Execute the closure with a reference to the data.
-            f(&*ptr)
-        };
-        // Exit the critical section.
-        rcu_read_unlock();
-        Ok(result)
-    }
-
-    /// Attempts to update the data protected by RCU using a Compare-And-Swap (CAS) operation.
-    /// The provided closure `f` generates the new data based on the current data.
-    /// If the CAS operation succeeds, the old data is safely reclaimed.
-    /// If it fails (due to concurrent updates), the operation is retried.
+    /// The provided closure is executed with a reference to the current data. If the pointer is null,
+    /// an error is returned. This ensures safe access to RCU-protected data.
     ///
     /// # Examples
     ///
@@ -147,6 +118,39 @@ impl<T> Rcu<T> {
     ///
     /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
     /// let rcu = get_rcu_int();
+    ///
+    /// rcu.read(|val| println!("Value: {}", val)).unwrap();
+    /// ```
+    pub fn read<F, R>(&self, f: F) -> Result<R, ()>
+    where
+        F: FnOnce(&T) -> R,
+    {
+        rcu_read_lock();
+        let ptr = rcu_dereference(&self.ptr);
+        let result = unsafe {
+            if ptr.is_null() {
+                rcu_read_unlock();
+                return Err(());
+            }
+            f(&*ptr)
+        };
+        rcu_read_unlock();
+        Ok(result)
+    }
+
+    /// Updates the RCU-protected data using the provided closure.
+    ///
+    /// This method atomically replaces the current data with new data generated by the closure. The
+    /// old data is safely reclaimed using deferred cleanup.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::{define_rcu, Rcu};
+    ///
+    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
+    /// let rcu = get_rcu_int();
+    ///
     /// rcu.try_update(|val| val + 1).unwrap();
     /// ```
     pub fn try_update<F>(&self, f: F) -> Result<(), ()>
@@ -156,15 +160,12 @@ impl<T> Rcu<T> {
         loop {
             let old_ptr = self.ptr.load(Ordering::SeqCst);
             if old_ptr.is_null() {
-                // If the pointer is null, exit the critical section and return an error.
                 return Err(());
             }
-            // Generate the new data based on the current data.
             let new_data = unsafe { f(&*old_ptr) };
             let new_box = Box::new(new_data);
             let new_ptr = Box::into_raw(new_box);
 
-            // Attempt to atomically replace the old pointer with the new pointer.
             match self
                 .ptr
                 .compare_exchange(old_ptr, new_ptr, Ordering::SeqCst, Ordering::SeqCst)
@@ -173,17 +174,12 @@ impl<T> Rcu<T> {
                     self.add_callback(free_callback, old_ptr);
                     return Ok(());
                 }
-                Err(_) => {
-                    // If the CAS operation failed, deallocate the new data and retry.
-                    unsafe { drop(Box::from_raw(new_ptr)) };
-                    // Continue the loop to retry the update.
-                    continue;
-                }
+                Err(_) => unsafe { drop(Box::from_raw(new_ptr)) },
             }
         }
     }
 
-    /// Adds a callback to the callback list.
+    /// Registers a callback to reclaim the old data.
     fn add_callback(&self, func: fn(*mut T), data: *mut T) {
         let cb = Box::new(Callback {
             func,
@@ -208,6 +204,25 @@ impl<T> Rcu<T> {
     }
 
     /// Processes all pending callbacks and executes them.
+    ///
+    /// This function should be called periodically to reclaim memory or perform other cleanup tasks
+    /// for outdated RCU-protected data.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::{Rcu, define_rcu};
+    ///
+    /// // Define an RCU-protected structure.
+    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
+    /// let rcu = get_rcu_int();
+    ///
+    /// // Perform an update to trigger deferred cleanup.
+    /// rcu.try_update(|val| val + 1).unwrap();
+    ///
+    /// // Process callbacks to reclaim old data.
+    /// rcu.process_callbacks();
+    /// ```
     pub fn process_callbacks(&self) {
         let mut cb_ptr = self.callbacks.swap(ptr::null_mut(), Ordering::AcqRel);
         while !cb_ptr.is_null() {
@@ -220,7 +235,7 @@ impl<T> Rcu<T> {
     }
 }
 
-/// Callback function to free old data.
+/// Default callback for freeing old data.
 fn free_callback<T>(ptr: *mut T) {
     unsafe {
         drop(Box::from_raw(ptr));
