@@ -169,12 +169,6 @@ impl<T> Rcu<T> {
                     // Exit the read-side critical section.
                     rcu_read_unlock();
 
-                    // Wait for all readers to finish before reclaiming the old data.
-                    synchronize_rcu();
-                    // Safely deallocate the old data.
-                    unsafe {
-                        let _ = Box::from_raw(old_ptr);
-                    }
                     return Ok(());
                 }
                 Err(_) => {
