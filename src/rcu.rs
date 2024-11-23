@@ -1,4 +1,4 @@
-use crate::thread_data::{rcu_dereference, rcu_read_lock, rcu_read_unlock, synchronize_rcu};
+use crate::thread_data::{rcu_dereference, rcu_read_lock, rcu_read_unlock};
 use std::ptr;
 use std::sync::atomic::AtomicPtr;
 use std::sync::atomic::Ordering;
@@ -178,17 +178,8 @@ impl<T> Rcu<T> {
     }
 }
 
-impl<T> Drop for Rcu<T> {
-    fn drop(&mut self) {
-        // Atomically swap the current pointer with null.
-        let data_ptr = self.ptr.swap(ptr::null_mut(), Ordering::SeqCst);
-        if !data_ptr.is_null() {
-            // If there was data, wait for all readers to finish.
-            synchronize_rcu();
-            // Safely deallocate the data.
-            unsafe {
-                let _ = Box::from_raw(data_ptr);
-            }
-        }
-    }
-}
+// impl<T> Drop for Rcu<T> {
+//     fn drop(&mut self) {
+//         // TODO: Implement Quiescent State-Based Reclamation (QSBR) for safe memory reclamation.
+//     }
+// }

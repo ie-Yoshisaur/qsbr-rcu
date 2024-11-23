@@ -23,39 +23,11 @@ impl ThreadData {
     }
 }
 
-impl Drop for ThreadData {
-    fn drop(&mut self) {
-        // Unregister the thread by setting `registered` to false.
-        self.registered.store(false, Ordering::SeqCst);
-
-        // Initialize pointers to traverse the global thread list.
-        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
-        let mut curr_ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
-
-        unsafe {
-            // Traverse the list to find and remove the current thread's ThreadData.
-            while !curr_ptr.is_null() {
-                if curr_ptr == (self as *const _ as *mut _) {
-                    // Remove the current ThreadData from the list by updating the previous pointer.
-                    let next = self.next.load(Ordering::SeqCst);
-                    (*prev_ptr).store(next, Ordering::SeqCst);
-                    break;
-                }
-                // Move to the next ThreadData in the list.
-                prev_ptr = &(*curr_ptr).next as *const _ as *mut AtomicPtr<ThreadData>;
-                curr_ptr = (*curr_ptr).next.load(Ordering::SeqCst);
-            }
-        }
-
-        // Wait until all readers have exited their critical sections.
-        synchronize_rcu();
-
-        // Safely deallocate the ThreadData memory.
-        unsafe {
-            let _ = Box::from_raw(self as *const _ as *mut ThreadData);
-        }
-    }
-}
+// impl Drop for ThreadData {
+//     fn drop(&mut self) {
+//         // TODO: Implement thread unregistration.
+//     }
+// }
 
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
