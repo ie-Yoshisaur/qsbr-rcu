@@ -3,5 +3,6 @@ name = "read-copy-update"
 version = "0.1.0"
 edition = "2021"
 authors = ["Yoshiaki Sano yoshiaki.sano.personal@gmail.com"]
+license = "MIT"
 
 [dependencies]
