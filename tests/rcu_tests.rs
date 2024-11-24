@@ -1,4 +1,4 @@
-use read_copy_update::{call_rcu, synchronize_rcu, Rcu};
+use read_copy_update::Rcu;
 use std::sync::Arc;
 use std::thread;
 
@@ -33,6 +33,7 @@ fn test_rcu_multithreaded_update_and_callback() {
     for _ in 0..num_threads {
         let rcu_clone = Arc::clone(&rcu);
         let handle = thread::spawn(move || {
+            rcu_clone.register_thread();
             for _ in 0..increments_per_thread {
                 increment_rcu_value(&rcu_clone);
             }
@@ -55,8 +56,8 @@ fn test_rcu_multithreaded_update_and_callback() {
     }
 
     // Ensure all updates are visible and process callbacks.
-    synchronize_rcu();
-    call_rcu(&rcu);
+    rcu.synchronize_rcu();
+    rcu.call_rcu();
 
     // Read the final value from the RCU-protected data.
     let final_value = rcu.read(|d| *d).unwrap();
@@ -76,8 +77,8 @@ fn test_rcu_callback_processing() {
         increment_rcu_value(&rcu);
     }
 
-    synchronize_rcu();
-    call_rcu(&rcu);
+    rcu.synchronize_rcu();
+    rcu.call_rcu();
 
     rcu.read(|val| {
         println!("Value after callback processing: {}", val);
