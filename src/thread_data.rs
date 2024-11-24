@@ -1,6 +1,6 @@
 use crate::Rcu;
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
 /// Thread-specific data structure used to track the state of each thread.
@@ -10,7 +10,7 @@ struct ThreadData {
     /// Indicates whether the thread is currently registered.
     registered: AtomicBool,
     /// Indicates whether the thread is within an RCU read-side critical section.
-    in_critical: AtomicBool,
+    local_counter: AtomicUsize,
 }
 
 impl ThreadData {
@@ -19,7 +19,7 @@ impl ThreadData {
         ThreadData {
             next: AtomicPtr::new(ptr::null_mut()),
             registered: AtomicBool::new(false),
-            in_critical: AtomicBool::new(false),
+            local_counter: AtomicUsize::new(0),
         }
     }
 }
@@ -34,6 +34,9 @@ thread_local! {
         td
     };
 }
+
+/// Global counter counter for synchronization
+static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
 
 /// The head of the global thread list, storing pointers to all registered ThreadData instances.
 static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
@@ -70,7 +73,9 @@ fn register_thread(td: &'static ThreadData) {
 /// ```
 pub fn rcu_read_lock() {
     THREAD_DATA.with(|td| {
-        td.in_critical.store(true, Ordering::SeqCst);
+        // Mark the thread as within a critical section.
+        let global_counter = GLOBAL_COUNTER.load(Ordering::SeqCst);
+        td.local_counter.store(global_counter, Ordering::SeqCst);
         // Ensure memory ordering to prevent reordering of read operations.
         std::sync::atomic::fence(Ordering::SeqCst);
     });
@@ -78,8 +83,7 @@ pub fn rcu_read_lock() {
 
 /// Marks the end of an RCU read-side critical section.
 ///
-/// This function clears the flag indicating that the current thread is within
-/// a critical section, allowing reclamation of outdated RCU data.
+/// This function does nothing but is provided for symmetry with `rcu_read_lock`.
 ///
 /// # Examples
 ///
@@ -94,13 +98,7 @@ pub fn rcu_read_lock() {
 /// // Exit the critical section.
 /// rcu_read_unlock();
 /// ```
-pub fn rcu_read_unlock() {
-    THREAD_DATA.with(|td| {
-        // Ensure memory ordering before releasing the critical section.
-        std::sync::atomic::fence(Ordering::SeqCst);
-        td.in_critical.store(false, Ordering::SeqCst);
-    });
-}
+pub fn rcu_read_unlock() {}
 
 /// Waits until all ongoing RCU read-side critical sections have completed.
 ///
@@ -125,17 +123,21 @@ pub fn rcu_read_unlock() {
 /// println!("All critical sections completed.");
 /// ```
 pub fn synchronize_rcu() {
+    let latest_counter = GLOBAL_COUNTER.fetch_add(1, Ordering::AcqRel);
+    let old_counter = latest_counter - 1;
+
     loop {
         let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
-        let mut any_in_critical = false;
+        let mut all_threads_observed = true;
 
         unsafe {
             // Traverse the global thread list to check if any thread is in a critical section.
             while !ptr.is_null() {
                 let td = &*ptr;
                 if td.registered.load(Ordering::SeqCst) {
-                    if td.in_critical.load(Ordering::SeqCst) {
-                        any_in_critical = true;
+                    let local_counter = td.local_counter.load(Ordering::SeqCst);
+                    if local_counter < old_counter {
+                        all_threads_observed = false;
                         break;
                     }
                 }
@@ -143,7 +145,7 @@ pub fn synchronize_rcu() {
             }
         }
 
-        if !any_in_critical {
+        if all_threads_observed {
             // If no threads are in a critical section, synchronization is complete.
             break;
         } else {
