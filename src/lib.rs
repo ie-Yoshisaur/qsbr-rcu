@@ -1,4 +1,3 @@
-mod macros;
 mod rcu;
 mod thread_data;
 

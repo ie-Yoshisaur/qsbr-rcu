@@ -1,4 +1,5 @@
-use read_copy_update::{call_rcu, define_rcu, synchronize_rcu, Rcu};
+use read_copy_update::{call_rcu, synchronize_rcu, Rcu};
+use std::sync::Arc;
 use std::thread;
 
 /// Increment the value stored in the RCU instance.
@@ -18,9 +19,8 @@ fn simulate_read(rcu: &Rcu<i32>, iterations: usize) {
 
 #[test]
 fn test_rcu_multithreaded_update_and_callback() {
-    // Define a static RCU instance for i32 with an initial value of 42.
-    define_rcu!(RCU_TEST_MULTI, get_rcu_test_multi, i32, 42);
-    let rcu = get_rcu_test_multi();
+    // Create a new RCU instance wrapped in Arc for shared ownership across threads.
+    let rcu = Arc::new(Rcu::new(42));
 
     // Define the number of threads and the number of increments each thread will perform.
     let num_threads = 10;
@@ -31,31 +31,34 @@ fn test_rcu_multithreaded_update_and_callback() {
 
     // Spawn multiple threads to perform concurrent increments.
     for _ in 0..num_threads {
-        let rcu_clone = rcu;
+        let rcu_clone = Arc::clone(&rcu);
         let handle = thread::spawn(move || {
             for _ in 0..increments_per_thread {
-                increment_rcu_value(rcu_clone);
+                increment_rcu_value(&rcu_clone);
             }
         });
         handles.push(handle);
     }
 
+    // Spawn multiple threads to perform concurrent reads.
     for _ in 0..num_threads {
-        let rcu_clone = rcu;
+        let rcu_clone = Arc::clone(&rcu);
         let handle = thread::spawn(move || {
-            simulate_read(rcu_clone, read_iterations);
+            simulate_read(&rcu_clone, read_iterations);
         });
         handles.push(handle);
     }
 
+    // Wait for all threads to finish.
     for handle in handles {
         handle.join().unwrap();
     }
 
-    // Read the final value from the RCU-protected data.
+    // Ensure all updates are visible and process callbacks.
     synchronize_rcu();
     call_rcu(&rcu);
 
+    // Read the final value from the RCU-protected data.
     let final_value = rcu.read(|d| *d).unwrap();
     println!("Final value: {}", final_value);
     // Verify that the final value matches the expected result.
@@ -66,12 +69,11 @@ fn test_rcu_multithreaded_update_and_callback() {
 
 #[test]
 fn test_rcu_callback_processing() {
-    // Define a static RCU instance for i32 with an initial value of 42.
-    define_rcu!(RCU_TEST_CALLBACK, get_rcu_test_callback, i32, 42);
-    let rcu = get_rcu_test_callback();
+    // Create a new RCU instance wrapped in Arc for shared ownership across threads.
+    let rcu = Arc::new(Rcu::new(42));
 
     for _ in 0..10 {
-        increment_rcu_value(rcu);
+        increment_rcu_value(&rcu);
     }
 
     synchronize_rcu();

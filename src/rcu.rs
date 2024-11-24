@@ -24,22 +24,24 @@ struct Callback<T> {
 ///
 /// ```rust
 /// use std::thread;
-/// use read_copy_update::{define_rcu, Rcu};
+/// use std::sync::Arc;
+/// use read_copy_update::Rcu;
 ///
-/// // Define an RCU instance with initial value 42.
-/// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-/// let rcu = get_rcu_int();
+/// // Create a new RCU instance wrapped in Arc for shared ownership across threads.
+/// let rcu = Arc::new(Rcu::new(42));
 ///
 /// // Reader thread accesses the current value.
+/// let rcu_clone = Arc::clone(&rcu);
 /// let reader = thread::spawn(move || {
-///     rcu.read(|val| {
+///     rcu_clone.read(|val| {
 ///         println!("Read value: {}", val);
 ///     }).expect("Failed to read value");
 /// });
 ///
 /// // Updater thread increments the value.
+/// let rcu_clone = Arc::clone(&rcu);
 /// let updater = thread::spawn(move || {
-///     rcu.try_update(|val| val + 1).expect("Update failed");
+///     rcu_clone.try_update(|val| val + 1).expect("Update failed");
 ///     println!("Value incremented.");
 /// });
 ///
@@ -71,41 +73,6 @@ impl<T> Rcu<T> {
         }
     }
 
-    /// Creates a new static RCU instance with an uninitialized state.
-    ///
-    /// Use `initialize` to set its value later.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use read_copy_update::Rcu;
-    ///
-    /// let rcu = Rcu::<i32>::new_static();
-    /// rcu.initialize(100); // Assign a value to the RCU instance.
-    /// ```
-    pub const fn new_static() -> Self {
-        Rcu {
-            ptr: AtomicPtr::new(ptr::null_mut()),
-            callbacks: AtomicPtr::new(ptr::null_mut()),
-        }
-    }
-
-    /// Initializes a static RCU instance with the provided data.
-    /// This operation is safe only if the RCU instance was created using `new_static`.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use read_copy_update::Rcu;
-    ///
-    /// let rcu = Rcu::new_static();
-    /// rcu.initialize(42); // Set initial value.
-    /// ```
-    pub fn initialize(&self, data: T) {
-        let boxed = Box::new(data);
-        self.ptr.store(Box::into_raw(boxed), Ordering::SeqCst);
-    }
-
     /// Reads the data protected by RCU in a read-side critical section.
     ///
     /// The provided closure is executed with a reference to the current data. If the pointer is null,
@@ -114,11 +81,9 @@ impl<T> Rcu<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use read_copy_update::{define_rcu, Rcu};
+    /// use read_copy_update::Rcu;
     ///
-    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-    /// let rcu = get_rcu_int();
-    ///
+    /// let rcu = Rcu::new(42);
     /// rcu.read(|val| println!("Value: {}", val)).unwrap();
     /// ```
     pub fn read<F, R>(&self, f: F) -> Result<R, ()>
@@ -146,11 +111,9 @@ impl<T> Rcu<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use read_copy_update::{define_rcu, Rcu};
+    /// use read_copy_update::Rcu;
     ///
-    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-    /// let rcu = get_rcu_int();
-    ///
+    /// let rcu = Rcu::new(42);
     /// rcu.try_update(|val| val + 1).unwrap();
     /// ```
     pub fn try_update<F>(&self, f: F) -> Result<(), ()>
@@ -211,16 +174,10 @@ impl<T> Rcu<T> {
     /// # Examples
     ///
     /// ```rust
-    /// use read_copy_update::{Rcu, define_rcu};
+    /// use read_copy_update::Rcu;
     ///
-    /// // Define an RCU-protected structure.
-    /// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-    /// let rcu = get_rcu_int();
-    ///
-    /// // Perform an update to trigger deferred cleanup.
+    /// let rcu = Rcu::new(42);
     /// rcu.try_update(|val| val + 1).unwrap();
-    ///
-    /// // Process callbacks to reclaim old data.
     /// rcu.process_callbacks();
     /// ```
     pub fn process_callbacks(&self) {

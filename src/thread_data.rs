@@ -192,16 +192,26 @@ pub fn synchronize_rcu() {
 /// # Examples
 ///
 /// ```rust
-/// use read_copy_update::{define_rcu, Rcu, call_rcu};
+/// use std::sync::Arc;
+/// use std::thread;
+/// use read_copy_update::{Rcu, call_rcu};
 ///
-/// define_rcu!(RCU_INT, get_rcu_int, i32, 42);
-/// let rcu = get_rcu_int();
+/// fn main() {
+///     let rcu = Arc::new(Rcu::new(42));
 ///
-/// // Update data and ensure safe reclamation.
-/// rcu.try_update(|val| val + 1).unwrap();
+///     // Update data
+///     rcu.try_update(|val| val + 1).unwrap();
+///     println!("Value incremented.");
 ///
-/// // Process callbacks to safely clean up outdated data.
-/// call_rcu(&rcu);
+///     // Process callbacks to safely clean up outdated data.
+///     call_rcu(&rcu);
+///
+///     // Verify the updated value
+///     rcu.read(|val| {
+///         println!("Value after callback processing: {}", val);
+///         assert!(*val >= 42);
+///     }).unwrap();
+/// }
 /// ```
 pub fn call_rcu<T>(rcu: &Rcu<T>) {
     synchronize_rcu();
