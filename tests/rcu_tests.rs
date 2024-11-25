@@ -33,7 +33,6 @@ fn test_rcu_multithreaded_update_and_callback() {
     for _ in 0..num_threads {
         let rcu_clone = Arc::clone(&rcu);
         let handle = thread::spawn(move || {
-            rcu_clone.register_thread();
             for _ in 0..increments_per_thread {
                 increment_rcu_value(&rcu_clone);
             }

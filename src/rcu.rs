@@ -49,9 +49,45 @@ impl ThreadData {
     }
 }
 
+/// Registers a thread to participate in RCU operations by adding its ThreadData
+/// to the global thread list.
+///
+/// This function is automatically called when a thread first accesses its thread-local
+/// RCU data structure. It ensures that writer threads can find all reader threads
+/// when checking for quiescent states.
+///
+/// # Implementation Details
+///
+/// * Marks the thread as registered using atomic operations
+/// * Adds the thread's data to the global linked list using a lock-free push
+/// * Uses SeqCst ordering to ensure visibility across all threads
+///
+/// # Safety
+///
+/// This function is safe to call multiple times but will only register a thread once.
+/// The ThreadData structure must have static lifetime as it will be accessed by other threads.
+fn register_thread(td: &'static ThreadData) {
+    // Mark the thread as registered.
+    td.registered.store(true, Ordering::SeqCst);
+    let td_ptr = td as *const _ as *mut _;
+
+    // Insert the new ThreadData at the head of the global list.
+    td.next
+        .store(THREAD_LIST_HEAD.load(Ordering::SeqCst), Ordering::SeqCst);
+    THREAD_LIST_HEAD.store(td_ptr, Ordering::SeqCst);
+}
+
+static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
+
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
-    static THREAD_DATA: ThreadData =  ThreadData::new();
+    static THREAD_DATA: &'static ThreadData = {
+        // Allocate and leak a new ThreadData instance to ensure it lives for the thread's lifetime.
+        let td = Box::leak(Box::new(ThreadData::new()));
+        // Register the thread's ThreadData in the global thread list.
+        register_thread(td);
+        td
+    };
 }
 
 /// A lock-free synchronization structure based on Read-Copy-Update (RCU).
@@ -94,7 +130,6 @@ pub struct Rcu<T> {
     ptr: AtomicPtr<T>, // Atomic pointer to the currently accessible data.
     callbacks: AtomicPtr<Callback<T>>, // Atomic pointer to the callback list for deferred cleanup.
     global_counter: AtomicUsize, // Global counter for synchronization
-    thread_list_head: AtomicPtr<ThreadData>, // Head of the global thread list
 }
 
 impl<T> Rcu<T> {
@@ -115,7 +150,6 @@ impl<T> Rcu<T> {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
             global_counter: AtomicUsize::new(1),
-            thread_list_head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -227,38 +261,6 @@ impl<T> Rcu<T> {
         }
     }
 
-    /// Registers a thread to participate in RCU operations by adding its ThreadData
-    /// to the global thread list.
-    ///
-    /// This function is automatically called when a thread first accesses its thread-local
-    /// RCU data structure. It ensures that writer threads can find all reader threads
-    /// when checking for quiescent states.
-    ///
-    /// # Implementation Details
-    ///
-    /// * Marks the thread as registered using atomic operations
-    /// * Adds the thread's data to the global linked list using a lock-free push
-    /// * Uses SeqCst ordering to ensure visibility across all threads
-    ///
-    /// # Safety
-    ///
-    /// This function is safe to call multiple times but will only register a thread once.
-    /// The ThreadData structure must have static lifetime as it will be accessed by other threads.
-    pub fn register_thread(&self) {
-        THREAD_DATA.with(|td| {
-            // Mark the thread as registered.
-            td.registered.store(true, Ordering::SeqCst);
-            let td_ptr = td as *const _ as *mut _;
-
-            // Insert the new ThreadData at the head of the global list.
-            td.next.store(
-                self.thread_list_head.load(Ordering::SeqCst),
-                Ordering::SeqCst,
-            );
-            self.thread_list_head.store(td_ptr, Ordering::SeqCst);
-        });
-    }
-
     /// Marks the beginning of an RCU read-side critical section.
     ///
     /// This function initializes the thread's `local_counter` with the current `global_counter`.
@@ -297,7 +299,8 @@ impl<T> Rcu<T> {
         let old_counter = latest_counter - 1;
 
         loop {
-            let mut ptr = self.thread_list_head.load(Ordering::SeqCst);
+            let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
+            println!("ptr: {:?}", ptr);
             let mut all_threads_observed = true;
 
             unsafe {
@@ -306,6 +309,7 @@ impl<T> Rcu<T> {
                     if td.registered.load(Ordering::SeqCst) {
                         let local_counter = td.local_counter.load(Ordering::SeqCst);
                         if local_counter < old_counter {
+                            println!("Thread {} not observed", ptr as usize);
                             all_threads_observed = false;
                             break;
                         }
