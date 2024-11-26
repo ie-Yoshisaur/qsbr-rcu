@@ -72,13 +72,16 @@ fn test_rcu_callback_processing() {
     // Create a new RCU instance wrapped in Arc for shared ownership across threads.
     let rcu = Arc::new(Rcu::new(42));
 
+    // Perform multiple increments.
     for _ in 0..10 {
         increment_rcu_value(&rcu);
     }
 
+    // Ensure all updates are visible and process callbacks.
     rcu.synchronize_rcu();
     rcu.call_rcu();
 
+    // Read and verify the value after callback processing.
     rcu.read(|val| {
         println!("Value after callback processing: {}", val);
         assert!(*val >= 42);

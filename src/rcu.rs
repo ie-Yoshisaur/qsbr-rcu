@@ -1,5 +1,5 @@
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
 /// Represents a callback structure used for deferred cleanup in RCU.
@@ -20,9 +20,8 @@ struct Callback<T> {
 ///
 /// # Fields
 ///
-/// * `next` - Forms a linked list of all thread data structures
-/// * `registered` - Indicates if this thread is participating in RCU operations
-/// * `local_counter` - Tracks the thread's local view of the global counter
+/// * `next` - Forms a linked list of all thread data structures.
+/// * `local_counter` - Tracks the thread's local view of the global counter.
 ///
 /// # Implementation Notes
 ///
@@ -32,9 +31,7 @@ struct Callback<T> {
 struct ThreadData {
     /// Pointer to the next ThreadData in the global list.
     next: AtomicPtr<ThreadData>,
-    /// Indicates whether the thread has been registered for RCU operations.
-    registered: AtomicBool,
-    /// Indicates whether the thread is within an RCU read-side critical section.
+    /// Tracks the thread's local view of the global counter.
     local_counter: AtomicUsize,
 }
 
@@ -43,9 +40,14 @@ impl ThreadData {
     fn new() -> Self {
         ThreadData {
             next: AtomicPtr::new(ptr::null_mut()),
-            registered: AtomicBool::new(false),
             local_counter: AtomicUsize::new(0),
         }
+    }
+}
+
+impl Drop for ThreadData {
+    fn drop(&mut self) {
+        unregister_thread(self);
     }
 }
 
@@ -56,36 +58,65 @@ impl ThreadData {
 /// RCU data structure. It ensures that writer threads can find all reader threads
 /// when checking for quiescent states.
 ///
-/// # Implementation Details
-///
-/// * Marks the thread as registered using atomic operations
-/// * Adds the thread's data to the global linked list using a lock-free push
-/// * Uses SeqCst ordering to ensure visibility across all threads
-///
 /// # Safety
 ///
 /// This function is safe to call multiple times but will only register a thread once.
 /// The ThreadData structure must have static lifetime as it will be accessed by other threads.
-fn register_thread(td: &'static ThreadData) {
-    // Mark the thread as registered.
-    td.registered.store(true, Ordering::SeqCst);
+fn register_thread(td: &ThreadData) {
     let td_ptr = td as *const _ as *mut _;
-
-    // Insert the new ThreadData at the head of the global list.
-    td.next
-        .store(THREAD_LIST_HEAD.load(Ordering::SeqCst), Ordering::SeqCst);
-    THREAD_LIST_HEAD.store(td_ptr, Ordering::SeqCst);
+    loop {
+        let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
+        (*td).next.store(head, Ordering::Relaxed);
+        if THREAD_LIST_HEAD
+            .compare_exchange(head, td_ptr, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
 }
 
+/// Unregisters a thread from participating in RCU operations by removing its ThreadData
+/// from the global thread list.
+///
+/// This function is called when a thread's ThreadData is dropped.
+fn unregister_thread(td: &ThreadData) {
+    let td_ptr = td as *const _ as *mut ThreadData;
+    loop {
+        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
+        let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
+
+        while !current_ptr.is_null() {
+            if current_ptr == td_ptr {
+                let next = (*td).next.load(Ordering::Acquire);
+                if unsafe {
+                    (*prev_ptr)
+                        .compare_exchange(current_ptr, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                } {
+                    return;
+                } else {
+                    break;
+                }
+            }
+            prev_ptr = unsafe { &(*current_ptr).next as *const _ as *mut AtomicPtr<ThreadData> };
+            current_ptr = unsafe { (*current_ptr).next.load(Ordering::Acquire) };
+        }
+
+        thread::yield_now();
+    }
+}
+
+static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
 static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
 
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
-    static THREAD_DATA: &'static ThreadData = {
+    static THREAD_DATA: Box<ThreadData> = {
         // Allocate and leak a new ThreadData instance to ensure it lives for the thread's lifetime.
-        let td = Box::leak(Box::new(ThreadData::new()));
+        let td = Box::new(ThreadData::new());
         // Register the thread's ThreadData in the global thread list.
-        register_thread(td);
+        register_thread(&td);
         td
     };
 }
@@ -129,7 +160,6 @@ thread_local! {
 pub struct Rcu<T> {
     ptr: AtomicPtr<T>, // Atomic pointer to the currently accessible data.
     callbacks: AtomicPtr<Callback<T>>, // Atomic pointer to the callback list for deferred cleanup.
-    global_counter: AtomicUsize, // Global counter for synchronization
 }
 
 impl<T> Rcu<T> {
@@ -149,7 +179,6 @@ impl<T> Rcu<T> {
         Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
-            global_counter: AtomicUsize::new(1),
         }
     }
 
@@ -263,12 +292,12 @@ impl<T> Rcu<T> {
 
     /// Marks the beginning of an RCU read-side critical section.
     ///
-    /// This function initializes the thread's `local_counter` with the current `global_counter`.
+    /// This function initializes the thread's `local_counter` with the current `GLOBAL_COUNTER`.
     /// It should be called before accessing RCU-protected data.
     fn rcu_read_lock(&self) {
         THREAD_DATA.with(|td| {
-            let global_counter = self.global_counter.load(Ordering::SeqCst);
-            td.local_counter.store(global_counter, Ordering::SeqCst);
+            td.local_counter
+                .store(GLOBAL_COUNTER.load(Ordering::SeqCst), Ordering::SeqCst);
             std::sync::atomic::fence(Ordering::SeqCst);
         });
     }
@@ -282,9 +311,9 @@ impl<T> Rcu<T> {
     ///
     /// # Implementation Details
     ///
-    /// * Increments the global counter atomically
-    /// * Checks each registered thread's local counter
-    /// * A thread has passed through a quiescent state if its local counter has caught up
+    /// * Increments the global counter atomically.
+    /// * Checks each registered thread's local counter.
+    /// * A thread has passed through a quiescent state if its local counter has caught up.
     ///
     /// # Examples
     ///
@@ -295,24 +324,21 @@ impl<T> Rcu<T> {
     /// rcu.synchronize_rcu();
     /// ```
     pub fn synchronize_rcu(&self) {
-        let latest_counter = self.global_counter.fetch_add(1, Ordering::AcqRel);
+        let latest_counter = GLOBAL_COUNTER.fetch_add(1, Ordering::AcqRel);
         let old_counter = latest_counter - 1;
 
         loop {
             let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
-            println!("ptr: {:?}", ptr);
             let mut all_threads_observed = true;
 
             unsafe {
                 while !ptr.is_null() {
                     let td = &*ptr;
-                    if td.registered.load(Ordering::SeqCst) {
-                        let local_counter = td.local_counter.load(Ordering::SeqCst);
-                        if local_counter < old_counter {
-                            println!("Thread {} not observed", ptr as usize);
-                            all_threads_observed = false;
-                            break;
-                        }
+                    let local_counter = td.local_counter.load(Ordering::SeqCst);
+                    if local_counter < old_counter {
+                        println!("Thread {} not observed", ptr as usize);
+                        all_threads_observed = false;
+                        break;
                     }
                     ptr = td.next.load(Ordering::SeqCst);
                 }
@@ -350,6 +376,21 @@ impl<T> Rcu<T> {
         let ptr = self.ptr.load(Ordering::SeqCst);
         std::sync::atomic::fence(Ordering::SeqCst);
         ptr
+    }
+}
+
+impl<T> Drop for Rcu<T> {
+    fn drop(&mut self) {
+        // Ensure all updates are visible and process callbacks.
+        self.call_rcu();
+
+        // Free the current data if it exists.
+        let ptr = self.ptr.swap(ptr::null_mut(), Ordering::SeqCst);
+        if !ptr.is_null() {
+            unsafe {
+                drop(Box::from_raw(ptr));
+            }
+        }
     }
 }
 
