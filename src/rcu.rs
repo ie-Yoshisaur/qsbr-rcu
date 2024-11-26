@@ -2,124 +2,7 @@ use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
-/// Represents a callback structure used for deferred cleanup in RCU.
-/// Each callback contains a function pointer (`func`) and associated data (`data`) to be processed later.
-///
-/// `Callback` forms a linked list through the `next` field, enabling multiple callbacks to be queued.
-struct Callback<T> {
-    func: fn(*mut T),             // Function to process or free the data.
-    data: *mut T,                 // Pointer to the associated data.
-    next: AtomicPtr<Callback<T>>, // Pointer to the next callback in the queue.
-}
-
-/// Thread-specific data structure used to track the state of each thread in RCU operations.
-///
-/// This structure is key to the QSBR (Quiescent State Based RCU) implementation. Each thread
-/// maintains its own counter that is compared against the global counter to determine if the
-/// thread has passed through a quiescent state since a particular write operation.
-///
-/// # Fields
-///
-/// * `next` - Forms a linked list of all thread data structures.
-/// * `local_counter` - Tracks the thread's local view of the global counter.
-///
-/// # Implementation Notes
-///
-/// The structure is allocated once per thread and lives for the entire thread lifetime.
-/// It is managed through thread-local storage and a global linked list for writer
-/// threads to traverse when checking for quiescent states.
-struct ThreadData {
-    /// Pointer to the next ThreadData in the global list.
-    next: AtomicPtr<ThreadData>,
-    /// Tracks the thread's local view of the global counter.
-    local_counter: AtomicUsize,
-}
-
-impl ThreadData {
-    /// Creates a new ThreadData instance with default values.
-    fn new() -> Self {
-        ThreadData {
-            next: AtomicPtr::new(ptr::null_mut()),
-            local_counter: AtomicUsize::new(0),
-        }
-    }
-}
-
-impl Drop for ThreadData {
-    fn drop(&mut self) {
-        unregister_thread(self);
-    }
-}
-
-/// Registers a thread to participate in RCU operations by adding its ThreadData
-/// to the global thread list.
-///
-/// This function is automatically called when a thread first accesses its thread-local
-/// RCU data structure. It ensures that writer threads can find all reader threads
-/// when checking for quiescent states.
-///
-/// # Safety
-///
-/// This function is safe to call multiple times but will only register a thread once.
-/// The ThreadData structure must have static lifetime as it will be accessed by other threads.
-fn register_thread(td: &ThreadData) {
-    let td_ptr = td as *const _ as *mut _;
-    loop {
-        let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
-        (*td).next.store(head, Ordering::Relaxed);
-        if THREAD_LIST_HEAD
-            .compare_exchange(head, td_ptr, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
-    }
-}
-
-/// Unregisters a thread from participating in RCU operations by removing its ThreadData
-/// from the global thread list.
-///
-/// This function is called when a thread's ThreadData is dropped.
-fn unregister_thread(td: &ThreadData) {
-    let td_ptr = td as *const _ as *mut ThreadData;
-    loop {
-        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
-        let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
-
-        while !current_ptr.is_null() {
-            if current_ptr == td_ptr {
-                let next = (*td).next.load(Ordering::Acquire);
-                if unsafe {
-                    (*prev_ptr)
-                        .compare_exchange(current_ptr, next, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                } {
-                    return;
-                } else {
-                    break;
-                }
-            }
-            prev_ptr = unsafe { &(*current_ptr).next as *const _ as *mut AtomicPtr<ThreadData> };
-            current_ptr = unsafe { (*current_ptr).next.load(Ordering::Acquire) };
-        }
-
-        thread::yield_now();
-    }
-}
-
 static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
-static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
-
-thread_local! {
-    /// Thread-local storage for each thread's ThreadData.
-    static THREAD_DATA: Box<ThreadData> = {
-        // Allocate and leak a new ThreadData instance to ensure it lives for the thread's lifetime.
-        let td = Box::new(ThreadData::new());
-        // Register the thread's ThreadData in the global thread list.
-        register_thread(&td);
-        td
-    };
-}
 
 /// A lock-free synchronization structure based on Read-Copy-Update (RCU).
 ///
@@ -279,7 +162,7 @@ impl<T> Rcu<T> {
     ///
     /// This function should be called periodically to reclaim memory or perform other cleanup tasks
     /// for outdated RCU-protected data.
-    fn process_callbacks(&self) {
+    pub fn process_callbacks(&self) {
         let mut cb_ptr = self.callbacks.swap(ptr::null_mut(), Ordering::AcqRel);
         while !cb_ptr.is_null() {
             unsafe {
@@ -328,15 +211,15 @@ impl<T> Rcu<T> {
         let old_counter = latest_counter - 1;
 
         loop {
-            let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
             let mut all_threads_observed = true;
 
             unsafe {
+                let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
+
                 while !ptr.is_null() {
                     let td = &*ptr;
                     let local_counter = td.local_counter.load(Ordering::SeqCst);
                     if local_counter < old_counter {
-                        println!("Thread {} not observed", ptr as usize);
                         all_threads_observed = false;
                         break;
                     }
@@ -350,22 +233,6 @@ impl<T> Rcu<T> {
                 thread::yield_now();
             }
         }
-    }
-
-    /// Processes all pending callbacks after ensuring all read-side critical sections have completed.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use read_copy_update::Rcu;
-    ///
-    /// let rcu = Rcu::new(42);
-    /// rcu.try_update(|val| val + 1).unwrap();
-    /// rcu.call_rcu();
-    /// ```
-    pub fn call_rcu(&self) {
-        self.synchronize_rcu();
-        self.process_callbacks();
     }
 
     /// Safely dereferences an RCU-protected atomic pointer.
@@ -382,7 +249,8 @@ impl<T> Rcu<T> {
 impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
         // Ensure all updates are visible and process callbacks.
-        self.call_rcu();
+        self.synchronize_rcu();
+        self.process_callbacks();
 
         // Free the current data if it exists.
         let ptr = self.ptr.swap(ptr::null_mut(), Ordering::SeqCst);
@@ -394,9 +262,132 @@ impl<T> Drop for Rcu<T> {
     }
 }
 
+/// Represents a callback structure used for deferred cleanup in RCU.
+/// Each callback contains a function pointer (`func`) and associated data (`data`) to be processed later.
+///
+/// `Callback` forms a linked list through the `next` field, enabling multiple callbacks to be queued.
+struct Callback<T> {
+    func: fn(*mut T),             // Function to process or free the data.
+    data: *mut T,                 // Pointer to the associated data.
+    next: AtomicPtr<Callback<T>>, // Pointer to the next callback in the queue.
+}
+
 /// Default callback for freeing old data.
 fn free_callback<T>(ptr: *mut T) {
     unsafe {
         drop(Box::from_raw(ptr));
+    }
+}
+
+static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
+
+thread_local! {
+    /// Thread-local storage for each thread's ThreadData.
+    pub static THREAD_DATA: Box<ThreadData> = {
+        // Allocate and leak a new ThreadData instance to ensure it lives for the thread's lifetime.
+        let td = Box::new(ThreadData::new());
+        // Register the thread's ThreadData in the global thread list.
+        register_thread(&td);
+        td
+    };
+}
+
+/// Thread-specific data structure used to track the state of each thread in RCU operations.
+///
+/// This structure is key to the QSBR (Quiescent State Based RCU) implementation. Each thread
+/// maintains its own counter that is compared against the global counter to determine if the
+/// thread has passed through a quiescent state since a particular write operation.
+///
+/// # Fields
+///
+/// * `next` - Forms a linked list of all thread data structures.
+/// * `local_counter` - Tracks the thread's local view of the global counter.
+///
+/// # Implementation Notes
+///
+/// The structure is allocated once per thread and lives for the entire thread lifetime.
+/// It is managed through thread-local storage and a global linked list for writer
+/// threads to traverse when checking for quiescent states.
+struct ThreadData {
+    /// Pointer to the next ThreadData in the global list.
+    next: AtomicPtr<ThreadData>,
+    /// Tracks the thread's local view of the global counter.
+    local_counter: AtomicUsize,
+}
+
+impl ThreadData {
+    /// Creates a new ThreadData instance with default values.
+    fn new() -> Self {
+        ThreadData {
+            next: AtomicPtr::new(ptr::null_mut()),
+            local_counter: AtomicUsize::new(0),
+        }
+    }
+}
+
+// ThreadData is stored in thread local storage using the thread_local! macro
+// Platform-specific behavior means drop() may not be called reliably
+// To ensure resources are properly cleaned up, we should handle dropping explicitly rather than relying on automatic drop behavior
+//
+// Source: https://doc.rust-lang.org/stable/std/thread/struct.LocalKey.html#platform-specific-behavior
+impl Drop for ThreadData {
+    fn drop(&mut self) {
+        unregister_thread(self);
+    }
+}
+
+/// Registers a thread to participate in RCU operations by adding its ThreadData
+/// to the global thread list.
+///
+/// This function is automatically called when a thread first accesses its thread-local
+/// RCU data structure. It ensures that writer threads can find all reader threads
+/// when checking for quiescent states.
+///
+/// # Safety
+///
+/// This function is safe to call multiple times but will only register a thread once.
+/// The ThreadData structure must have static lifetime as it will be accessed by other threads.
+fn register_thread(td: &ThreadData) {
+    let td_ptr = td as *const _ as *mut _;
+    loop {
+        let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
+        (*td).next.store(head, Ordering::Relaxed);
+        if THREAD_LIST_HEAD
+            .compare_exchange(head, td_ptr, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            break;
+        }
+    }
+}
+
+/// Unregisters a thread from participating in RCU operations by removing its ThreadData
+/// from the global thread list.
+///
+/// This function is called when a thread's ThreadData is dropped.
+fn unregister_thread(td: &ThreadData) {
+    let td_ptr = td as *const _ as *mut ThreadData;
+    loop {
+        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
+        let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
+
+        while !current_ptr.is_null() {
+            if current_ptr == td_ptr {
+                let next = (*td).next.load(Ordering::Acquire);
+                if unsafe {
+                    (*prev_ptr)
+                        .compare_exchange(current_ptr, next, Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                } {
+                    return;
+                } else {
+                    break;
+                }
+            }
+            prev_ptr = unsafe { &(*current_ptr).next as *const _ as *mut AtomicPtr<ThreadData> };
+            current_ptr = unsafe { (*current_ptr).next.load(Ordering::Acquire) };
+        }
+
+        thread::yield_now();
     }
 }
