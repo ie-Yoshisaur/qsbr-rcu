@@ -1,3 +1,4 @@
+use std::cell::RefCell;
 use std::ptr;
 use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
@@ -179,9 +180,15 @@ impl<T> Rcu<T> {
     /// It should be called before accessing RCU-protected data.
     fn rcu_read_lock(&self) {
         THREAD_DATA.with(|td| {
-            td.local_counter
-                .store(GLOBAL_COUNTER.load(Ordering::SeqCst), Ordering::SeqCst);
-            std::sync::atomic::fence(Ordering::SeqCst);
+            let td_borrowed = td.borrow();
+            if let Some(ref thread_data) = *td_borrowed {
+                thread_data
+                    .local_counter
+                    .store(GLOBAL_COUNTER.load(Ordering::SeqCst), Ordering::SeqCst);
+                std::sync::atomic::fence(Ordering::SeqCst);
+            } else {
+                panic!("Thread data not initialized.");
+            }
         });
     }
 
@@ -212,11 +219,21 @@ impl<T> Rcu<T> {
 
         loop {
             let mut all_threads_observed = true;
+            let current_thread_data_ptr = THREAD_DATA.with(|td| {
+                td.borrow().as_ref().map_or(ptr::null_mut(), |td_box| {
+                    &**td_box as *const ThreadData as *mut ThreadData
+                })
+            });
 
             unsafe {
                 let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
 
                 while !ptr.is_null() {
+                    if ptr == current_thread_data_ptr {
+                        ptr = (*ptr).next.load(Ordering::SeqCst);
+                        continue;
+                    }
+
                     let td = &*ptr;
                     let local_counter = td.local_counter.load(Ordering::SeqCst);
                     if local_counter < old_counter {
@@ -283,13 +300,13 @@ static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut())
 
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
-    pub static THREAD_DATA: Box<ThreadData> = {
-        // Allocate and leak a new ThreadData instance to ensure it lives for the thread's lifetime.
+    pub static THREAD_DATA: RefCell<Option<Box<ThreadData>>> = RefCell::new(Some({
+        // Allocate a new ThreadData instance.
         let td = Box::new(ThreadData::new());
         // Register the thread's ThreadData in the global thread list.
         register_thread(&td);
         td
-    };
+    }));
 }
 
 /// Thread-specific data structure used to track the state of each thread in RCU operations.
@@ -390,4 +407,23 @@ fn unregister_thread(td: &ThreadData) {
 
         thread::yield_now();
     }
+}
+
+pub fn drop_thread_data() {
+    THREAD_DATA.with(|td| {
+        if let Some(td) = td.borrow_mut().take() {
+            unregister_thread(&td);
+        }
+    });
+}
+
+#[macro_export]
+macro_rules! rcu_thread_spawn {
+    ($($body:tt)*) => {
+        std::thread::spawn(move || {
+            let result = { $($body)* };
+            read_copy_update::drop_thread_data();
+            result
+        })
+    };
 }
