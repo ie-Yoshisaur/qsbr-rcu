@@ -1,6 +1,6 @@
 use std::cell::RefCell;
 use std::ptr;
-use std::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
 static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
@@ -225,6 +225,7 @@ impl<T> Rcu<T> {
                 })
             });
 
+            lock_thread_list();
             unsafe {
                 let mut ptr = THREAD_LIST_HEAD.load(Ordering::SeqCst);
 
@@ -243,6 +244,7 @@ impl<T> Rcu<T> {
                     ptr = td.next.load(Ordering::SeqCst);
                 }
             }
+            unlock_thread_list();
 
             if all_threads_observed {
                 break;
@@ -294,6 +296,22 @@ fn free_callback<T>(ptr: *mut T) {
     unsafe {
         drop(Box::from_raw(ptr));
     }
+}
+
+static THREAD_LIST_LOCK: AtomicBool = AtomicBool::new(false);
+
+fn lock_thread_list() {
+    // Spin until the lock is acquired
+    while THREAD_LIST_LOCK
+        .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+        .is_err()
+    {
+        std::thread::yield_now(); // Yield to avoid busy waiting
+    }
+}
+
+fn unlock_thread_list() {
+    THREAD_LIST_LOCK.store(false, Ordering::Release);
 }
 
 static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
@@ -366,16 +384,12 @@ impl Drop for ThreadData {
 /// The ThreadData structure must have static lifetime as it will be accessed by other threads.
 fn register_thread(td: &ThreadData) {
     let td_ptr = td as *const _ as *mut _;
-    loop {
-        let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
-        (*td).next.store(head, Ordering::Relaxed);
-        if THREAD_LIST_HEAD
-            .compare_exchange(head, td_ptr, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            break;
-        }
-    }
+
+    lock_thread_list();
+    let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
+    td.next.store(head, Ordering::Relaxed);
+    THREAD_LIST_HEAD.store(td_ptr, Ordering::Release);
+    unlock_thread_list();
 }
 
 /// Unregisters a thread from participating in RCU operations by removing its ThreadData
@@ -384,29 +398,24 @@ fn register_thread(td: &ThreadData) {
 /// This function is called when a thread's ThreadData is dropped.
 fn unregister_thread(td: &ThreadData) {
     let td_ptr = td as *const _ as *mut ThreadData;
-    loop {
-        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
-        let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
 
-        while !current_ptr.is_null() {
-            if current_ptr == td_ptr {
-                let next = (*td).next.load(Ordering::Acquire);
-                if unsafe {
-                    (*prev_ptr)
-                        .compare_exchange(current_ptr, next, Ordering::AcqRel, Ordering::Acquire)
-                        .is_ok()
-                } {
-                    return;
-                } else {
-                    break;
-                }
+    lock_thread_list();
+    let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
+    let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
+
+    while !current_ptr.is_null() {
+        if current_ptr == td_ptr {
+            let next = td.next.load(Ordering::Acquire);
+            unsafe {
+                (*prev_ptr).store(next, Ordering::Release);
             }
-            prev_ptr = unsafe { &(*current_ptr).next as *const _ as *mut AtomicPtr<ThreadData> };
-            current_ptr = unsafe { (*current_ptr).next.load(Ordering::Acquire) };
+            unlock_thread_list();
+            return;
         }
-
-        thread::yield_now();
+        prev_ptr = unsafe { &(*current_ptr).next as *const _ as *mut AtomicPtr<ThreadData> };
+        current_ptr = unsafe { (*current_ptr).next.load(Ordering::Acquire) };
     }
+    unlock_thread_list();
 }
 
 pub fn drop_thread_data() {
