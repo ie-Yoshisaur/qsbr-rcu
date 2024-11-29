@@ -170,6 +170,13 @@ impl<T> Rcu<T> {
     }
 
     /// Registers a callback to reclaim the old data.
+    ///
+    /// This function queues a callback that will be executed once it's safe to reclaim the old data.
+    ///
+    /// # Parameters
+    ///
+    /// - `func`: The callback function to execute.
+    /// - `data`: The data to be passed to the callback.
     fn add_callback(&self, func: fn(*mut T), data: *mut T) {
         let cb = Box::new(Callback {
             func,
@@ -187,6 +194,19 @@ impl<T> Rcu<T> {
         self.unlock_callback_list();
     }
 
+    /// Marks the current thread as having reached a quiescent state.
+    ///
+    /// This function should be called periodically by reader threads to indicate that they have
+    /// completed their current read-side critical section and are in a quiescent state.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::Rcu;
+    ///
+    /// let rcu = Rcu::new(42);
+    /// rcu.rcu_quiescent_state(); // Indicate quiescent state
+    /// ```
     pub fn rcu_quiescent_state(&self) {
         THREAD_DATA.with(|td| {
             td.local_counter
@@ -195,6 +215,19 @@ impl<T> Rcu<T> {
         });
     }
 
+    /// Initiates garbage collection by processing safe callbacks and cleaning up thread data.
+    ///
+    /// This method should be called periodically by writer threads to reclaim memory or perform
+    /// other cleanup tasks for outdated RCU-protected data.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::Rcu;
+    ///
+    /// let rcu = Rcu::new(42);
+    /// rcu.gc(); // Perform garbage collection
+    /// ```
     pub fn gc(&self) {
         let safe_callbacks = self.synchronize_rcu();
         self.process_callbacks(safe_callbacks);
@@ -220,11 +253,14 @@ impl<T> Rcu<T> {
 
     /// Waits until all ongoing RCU read-side critical sections have completed.
     ///
+    /// This function ensures that all reader threads have passed through a quiescent state
+    /// since the last update, making it safe to reclaim outdated data.
+    ///
     /// # Implementation Details
     ///
-    /// * Increments the global counter atomically.
-    /// * Checks each registered thread's local counter.
-    /// * A thread has passed through a quiescent state if its local counter has caught up.
+    /// - Increments the global counter atomically.
+    /// - Checks each registered thread's local counter.
+    /// - A thread has passed through a quiescent state if its local counter has caught up.
     fn synchronize_rcu(&self) -> *mut Callback<T> {
         self.rcu_quiescent_state();
         let latest_counter = self.global_counter.fetch_add(1, Ordering::Relaxed);
@@ -267,12 +303,29 @@ impl<T> Rcu<T> {
         safe_callback_list
     }
 
-    /// Registers a thread to participate in RCU operations
+    /// Registers a thread to participate in RCU operations.
+    ///
+    /// This function should be called when a thread starts using RCU-protected data to ensure that
+    /// it is tracked for quiescent state detection.
     ///
     /// # Safety
     ///
-    /// This function is safe to call multiple times but will only register a thread once.
-    /// The ThreadData structure must have static lifetime as it will be accessed by other threads.
+    /// - The `ThreadData` reference must remain valid for the lifetime of the thread.
+    /// - This function is safe to call multiple times but will only register a thread once.
+    ///
+    /// # Parameters
+    ///
+    /// - `td`: A reference to the thread's `ThreadData` structure.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::{Rcu, ThreadData};
+    ///
+    /// let rcu = Rcu::new(42);
+    /// let td = read_copy_update::get_current_thread_data();
+    /// rcu.register_thread(&td);
+    /// ```
     pub fn register_thread(&self, td: &ThreadData) {
         let td_ptr: *mut ThreadData = td as *const _ as *mut ThreadData;
 
@@ -284,13 +337,33 @@ impl<T> Rcu<T> {
         self.unlock_thread_list();
     }
 
-    /// Unregisters a thread from participating in RCU operations
+    /// Unregisters a thread from participating in RCU operations.
     ///
-    /// This function is called when a thread's ThreadData is dropped.
+    /// This function should be called when a thread no longer needs to participate in RCU operations,
+    /// typically when the thread is about to exit.
+    ///
+    /// # Parameters
+    ///
+    /// - `td`: A reference to the thread's `ThreadData` structure.
+    ///
+    /// # Examples
+    ///
+    /// ```rust
+    /// use read_copy_update::{Rcu, ThreadData};
+    ///
+    /// let rcu = Rcu::new(42);
+    /// let td = read_copy_update::get_current_thread_data();
+    /// rcu.unregister_thread(&td);
+    /// ```
     pub fn unregister_thread(&self, td: &ThreadData) {
         td.active.store(false, Ordering::Release);
     }
 
+    /// Cleans up the thread list by removing inactive threads.
+    ///
+    /// This function iterates through the list of registered threads and removes any that are
+    /// no longer active. It helps prevent memory leaks by ensuring that `ThreadData` structures
+    /// for terminated threads are properly deallocated.
     fn clean_thread_list(&self) {
         let mut prev_ptr = &self.thread_list_head as *const _ as *mut AtomicPtr<ThreadData>;
         let mut current_ptr = self.thread_list_head.load(Ordering::Acquire);
@@ -316,6 +389,7 @@ impl<T> Rcu<T> {
         self.unlock_thread_list();
     }
 
+    /// Acquires a lock on the thread list to ensure exclusive access.
     fn lock_thread_list(&self) {
         while self
             .thread_list_lock
@@ -326,10 +400,12 @@ impl<T> Rcu<T> {
         }
     }
 
+    /// Releases the lock on the thread list.
     fn unlock_thread_list(&self) {
         self.thread_list_lock.store(false, Ordering::Release);
     }
 
+    /// Acquires a lock on the callback list to ensure exclusive access.
     fn lock_callback_list(&self) {
         while self
             .callback_list_lock
@@ -340,6 +416,7 @@ impl<T> Rcu<T> {
         }
     }
 
+    /// Releases the lock on the callback list.
     fn unlock_callback_list(&self) {
         self.callback_list_lock.store(false, Ordering::Release);
     }
@@ -359,9 +436,16 @@ impl<T> Drop for Rcu<T> {
 }
 
 /// Represents a callback structure used for deferred cleanup in RCU.
+///
 /// Each callback contains a function pointer (`func`) and associated data (`data`) to be processed later.
 ///
 /// `Callback` forms a linked list through the `next` field, enabling multiple callbacks to be queued.
+///
+/// # Fields
+///
+/// * `func` - Function to process or free the data.
+/// * `data` - Pointer to the associated data.
+/// * `next` - Pointer to the next callback in the queue.
 struct Callback<T> {
     func: fn(*mut T),             // Function to process or free the data.
     data: *mut T,                 // Pointer to the associated data.
@@ -369,6 +453,28 @@ struct Callback<T> {
 }
 
 /// Default callback for freeing old data.
+///
+/// This function safely deallocates memory by converting the raw pointer back into a `Box` and
+/// dropping it.
+///
+/// # Parameters
+///
+/// - `ptr`: A raw pointer to the data to be freed.
+///
+/// # Safety
+///
+/// - The pointer `ptr` must have been allocated using `Box::into_raw` and must not be used
+///   after this function is called.
+///
+/// # Examples
+///
+/// ```rust
+/// fn free_callback<T>(ptr: *mut T) {
+///     unsafe {
+///         drop(Box::from_raw(ptr));
+///     }
+/// }
+/// ```
 fn free_callback<T>(ptr: *mut T) {
     unsafe {
         drop(Box::from_raw(ptr));
@@ -376,8 +482,12 @@ fn free_callback<T>(ptr: *mut T) {
 }
 
 thread_local! {
-    /// Thread-local storage for each thread's ThreadData.
-    static THREAD_DATA: &'static ThreadData= {
+    /// Thread-local storage for each thread's `ThreadData`.
+    ///
+    /// Each thread has its own `ThreadData` instance, which is used to track the thread's
+    /// participation in RCU operations. This structure is essential for implementing
+    /// Quiescent State Based RCU (QSBR).
+    static THREAD_DATA: &'static ThreadData = {
         // Allocate a new ThreadData instance.
         let td = Box::leak(Box::new(ThreadData::new()));
         td
@@ -394,6 +504,7 @@ thread_local! {
 ///
 /// * `next` - Forms a linked list of all thread data structures.
 /// * `local_counter` - Tracks the thread's local view of the global counter.
+/// * `active` - Indicates whether the thread is currently active in RCU operations.
 ///
 /// # Implementation Notes
 ///
@@ -401,7 +512,7 @@ thread_local! {
 /// It is managed through thread-local storage and a global linked list for writer
 /// threads to traverse when checking for quiescent states.
 pub struct ThreadData {
-    /// Pointer to the next ThreadData in the global list.
+    /// Pointer to the next `ThreadData` in the global list.
     next: AtomicPtr<ThreadData>,
     /// Tracks the thread's local view of the global counter.
     local_counter: AtomicUsize,
@@ -410,7 +521,10 @@ pub struct ThreadData {
 }
 
 impl ThreadData {
-    /// Creates a new ThreadData instance with default values.
+    /// Creates a new `ThreadData` instance with default values.
+    ///
+    /// Initializes the `next` pointer to `null`, sets the `local_counter` to `0`,
+    /// and marks the thread as inactive.
     fn new() -> Self {
         ThreadData {
             next: AtomicPtr::new(ptr::null_mut()),
@@ -420,22 +534,72 @@ impl ThreadData {
     }
 }
 
+/// Retrieves the current thread's `ThreadData`.
+///
+/// This function provides access to the thread-local `ThreadData` structure, which is
+/// used internally by the RCU implementation to track the thread's state.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::get_current_thread_data;
+///
+/// let td = get_current_thread_data();
+/// println!("Local counter: {}", td.local_counter.load(std::sync::atomic::Ordering::Relaxed));
+/// ```
 pub fn get_current_thread_data() -> &'static ThreadData {
     THREAD_DATA.with(|td| *td)
 }
 
+/// Marks the current thread as no longer participating in RCU operations.
+///
+/// This function should be called when a thread is about to terminate or when it no longer
+/// needs to participate in RCU operations. It updates the thread's `active` status accordingly.
+///
+/// # Examples
+///
+/// ```rust
+/// use read_copy_update::{Rcu, drop_thread_data};
+///
+/// let rcu = Rcu::new(42);
+/// drop_thread_data(); // Unregister the thread from RCU operations
+/// ```
 pub fn drop_thread_data() {
     THREAD_DATA.with(|td| {
         td.active.store(false, Ordering::Release);
     });
 }
 
+/// A macro for spawning a new thread that automatically registers and unregisters its
+/// `ThreadData` with the provided `Rcu` instance.
+///
+/// This macro ensures that the thread participates in RCU operations by registering its
+/// `ThreadData` upon creation and unregistering it before termination.
+///
+/// # Examples
+///
+/// ```rust
+/// use std::sync::Arc;
+/// use read_copy_update::{rcu_thread_spawn, Rcu};
+///
+/// let rcu = Arc::new(Rcu::new(100));
+///
+/// let rcu_clone = Arc::clone(&rcu);
+/// let handle = rcu_thread_spawn!(rcu_clone, {
+///     // Thread body
+///     rcu_clone.read(|val| {
+///         println!("Thread read value: {}", val);
+///     }).unwrap();
+/// });
+///
+/// handle.join().unwrap();
+/// ```
 #[macro_export]
 macro_rules! rcu_thread_spawn {
     ($rcu_clone:expr, $($body:tt)*) => {
         std::thread::spawn(move || {
-        let td = read_copy_update::get_current_thread_data();
-                $rcu_clone.register_thread(&td);
+            let td = read_copy_update::get_current_thread_data();
+            $rcu_clone.register_thread(&td);
             let result = {
                 $($body)*
             };
