@@ -2,32 +2,6 @@ use std::ptr;
 use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
 use std::thread;
 
-static GLOBAL_COUNTER: AtomicUsize = AtomicUsize::new(1);
-static SYNCHRONIZE_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Guard for the synchronize lock.
-/// Automatically releases the lock when dropped.
-struct SynchronizeLockGuard;
-
-impl SynchronizeLockGuard {
-    /// Acquires the synchronize lock and returns a guard.
-    fn lock() -> Self {
-        while SYNCHRONIZE_LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now();
-        }
-        SynchronizeLockGuard
-    }
-}
-
-impl Drop for SynchronizeLockGuard {
-    fn drop(&mut self) {
-        SYNCHRONIZE_LOCK.store(false, Ordering::Release);
-    }
-}
-
 /// A lock-free synchronization structure based on Read-Copy-Update (RCU).
 ///
 /// RCU allows readers to access shared data without blocking, while writers perform updates by
@@ -57,7 +31,7 @@ impl Drop for SynchronizeLockGuard {
 /// // Updater thread increments the value.
 /// let rcu_clone = Arc::clone(&rcu);
 /// let updater = thread::spawn(move || {
-///     rcu_clone.try_update(|val| val + 1).expect("Update failed");
+///     rcu_clone.write(|val| val + 1).expect("Update failed");
 ///     println!("Value incremented.");
 /// });
 ///
@@ -66,7 +40,11 @@ impl Drop for SynchronizeLockGuard {
 /// ```
 pub struct Rcu<T> {
     ptr: AtomicPtr<T>, // Atomic pointer to the currently accessible data.
+    thread_list_head: AtomicPtr<ThreadData>,
     callbacks: AtomicPtr<Callback<T>>, // Atomic pointer to the callback list for deferred cleanup.
+    global_counter: AtomicUsize,
+    thread_list_lock: AtomicBool,
+    callback_list_lock: AtomicBool,
 }
 
 impl<T> Rcu<T> {
@@ -86,6 +64,10 @@ impl<T> Rcu<T> {
         Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
+            global_counter: AtomicUsize::new(1),
+            callback_list_lock: AtomicBool::new(false),
+            thread_list_lock: AtomicBool::new(false),
+            thread_list_head: AtomicPtr::new(ptr::null_mut()),
         }
     }
 
@@ -125,8 +107,10 @@ impl<T> Rcu<T> {
     /// It should be called before accessing RCU-protected data.
     fn rcu_read_lock(&self) {
         THREAD_DATA.with(|td| {
-            td.local_counter
-                .store(GLOBAL_COUNTER.load(Ordering::Relaxed), Ordering::SeqCst);
+            td.local_counter.store(
+                self.global_counter.load(Ordering::Relaxed),
+                Ordering::SeqCst,
+            );
             std::sync::atomic::fence(Ordering::Acquire);
         });
     }
@@ -157,7 +141,7 @@ impl<T> Rcu<T> {
     /// use read_copy_update::Rcu;
     ///
     /// let rcu = Rcu::new(42);
-    /// rcu.try_update(|val| val + 1).unwrap();
+    /// rcu.write(|val| val + 1).unwrap();
     /// ```
     pub fn write<F>(&self, f: F) -> Result<(), ()>
     where
@@ -194,24 +178,24 @@ impl<T> Rcu<T> {
         });
         let cb_ptr = Box::into_raw(cb);
 
-        let _guard = CallbackListLockGuard::lock();
+        self.lock_callback_list();
         unsafe {
             let head = self.callbacks.load(Ordering::Acquire);
             (*cb_ptr).next.store(head, Ordering::Relaxed);
             self.callbacks.store(cb_ptr, Ordering::Release);
         }
+        self.unlock_callback_list();
     }
 
     pub fn rcu_quiescent_state(&self) {
         THREAD_DATA.with(|td| {
             td.local_counter
-                .store(GLOBAL_COUNTER.load(Ordering::SeqCst), Ordering::SeqCst);
+                .store(self.global_counter.load(Ordering::SeqCst), Ordering::SeqCst);
             std::sync::atomic::fence(Ordering::SeqCst);
         });
     }
 
     pub fn gc(&self) {
-        self.rcu_quiescent_state();
         let safe_callbacks = self.synchronize_rcu();
         self.process_callbacks(safe_callbacks);
         self.clean_thread_list();
@@ -223,6 +207,7 @@ impl<T> Rcu<T> {
     /// for outdated RCU-protected data.
     fn process_callbacks(&self, callbacks: *mut Callback<T>) {
         let mut cb_ptr = callbacks;
+        self.lock_callback_list();
         while !cb_ptr.is_null() {
             unsafe {
                 let cb = Box::from_raw(cb_ptr);
@@ -230,6 +215,7 @@ impl<T> Rcu<T> {
                 cb_ptr = cb.next.load(Ordering::Acquire);
             }
         }
+        self.unlock_callback_list();
     }
 
     /// Waits until all ongoing RCU read-side critical sections have completed.
@@ -239,28 +225,18 @@ impl<T> Rcu<T> {
     /// * Increments the global counter atomically.
     /// * Checks each registered thread's local counter.
     /// * A thread has passed through a quiescent state if its local counter has caught up.
-    ///
-    /// # Examples
-    ///
-    /// ```rust
-    /// use read_copy_update::Rcu;
-    ///
-    /// let rcu = Rcu::new(42);
-    /// rcu.synchronize_rcu();
-    /// ```
     fn synchronize_rcu(&self) -> *mut Callback<T> {
-        let _synchronize_guard = SynchronizeLockGuard::lock();
         self.rcu_quiescent_state();
-        let latest_counter = GLOBAL_COUNTER.fetch_add(1, Ordering::Relaxed);
+        let latest_counter = self.global_counter.fetch_add(1, Ordering::Relaxed);
         let old_counter = latest_counter - 1;
 
         loop {
             let mut all_threads_observed = true;
 
             unsafe {
-                let _guard = ThreadListLockGuard::lock();
-                let mut ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
-
+                self.lock_thread_list();
+                let mut ptr = self.thread_list_head.load(Ordering::Acquire);
+                self.lock_callback_list();
                 while !ptr.is_null() {
                     let td = &*ptr;
                     if !td.active.load(Ordering::Acquire) {
@@ -275,29 +251,51 @@ impl<T> Rcu<T> {
                     }
                     ptr = td.next.load(Ordering::Acquire);
                 }
+                self.unlock_thread_list();
             }
 
             if all_threads_observed {
+                self.unlock_thread_list();
                 break;
             } else {
                 thread::yield_now();
             }
         }
 
-        self.swap_callbacks()
+        let safe_callback_list = self.callbacks.swap(ptr::null_mut(), Ordering::AcqRel);
+        self.unlock_callback_list();
+        safe_callback_list
     }
 
-    fn swap_callbacks(&self) -> *mut Callback<T> {
-        let _guard = CallbackListLockGuard::lock();
-        let cb_ptr = self.callbacks.swap(ptr::null_mut(), Ordering::AcqRel);
-        cb_ptr
+    /// Registers a thread to participate in RCU operations
+    ///
+    /// # Safety
+    ///
+    /// This function is safe to call multiple times but will only register a thread once.
+    /// The ThreadData structure must have static lifetime as it will be accessed by other threads.
+    pub fn register_thread(&self, td: &ThreadData) {
+        let td_ptr: *mut ThreadData = td as *const _ as *mut ThreadData;
+
+        td.active.store(true, Ordering::Release);
+        self.lock_thread_list();
+        let head = self.thread_list_head.load(Ordering::Acquire);
+        td.next.store(head, Ordering::Relaxed);
+        self.thread_list_head.store(td_ptr, Ordering::Release);
+        self.unlock_thread_list();
+    }
+
+    /// Unregisters a thread from participating in RCU operations
+    ///
+    /// This function is called when a thread's ThreadData is dropped.
+    pub fn unregister_thread(&self, td: &ThreadData) {
+        td.active.store(false, Ordering::Release);
     }
 
     fn clean_thread_list(&self) {
-        let _guard = ThreadListLockGuard::lock();
-        let mut prev_ptr = &THREAD_LIST_HEAD as *const _ as *mut AtomicPtr<ThreadData>;
-        let mut current_ptr = THREAD_LIST_HEAD.load(Ordering::Acquire);
+        let mut prev_ptr = &self.thread_list_head as *const _ as *mut AtomicPtr<ThreadData>;
+        let mut current_ptr = self.thread_list_head.load(Ordering::Acquire);
 
+        self.lock_thread_list();
         while !current_ptr.is_null() {
             let td = unsafe { &*current_ptr };
             if !td.active.load(Ordering::Acquire) {
@@ -315,6 +313,35 @@ impl<T> Rcu<T> {
                 current_ptr = td.next.load(Ordering::Acquire);
             }
         }
+        self.unlock_thread_list();
+    }
+
+    fn lock_thread_list(&self) {
+        while self
+            .thread_list_lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            thread::yield_now();
+        }
+    }
+
+    fn unlock_thread_list(&self) {
+        self.thread_list_lock.store(false, Ordering::Release);
+    }
+
+    fn lock_callback_list(&self) {
+        while self
+            .callback_list_lock
+            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
+            .is_err()
+        {
+            thread::yield_now();
+        }
+    }
+
+    fn unlock_callback_list(&self) {
+        self.callback_list_lock.store(false, Ordering::Release);
     }
 }
 
@@ -322,38 +349,12 @@ impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
         self.gc();
 
-        // Free the current data if it exists.
         let ptr = self.ptr.swap(ptr::null_mut(), Ordering::SeqCst);
         if !ptr.is_null() {
             unsafe {
                 drop(Box::from_raw(ptr));
             }
         }
-    }
-}
-
-static CALLBACK_LIST_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Guard for the callback list lock.
-/// Automatically releases the lock when dropped.
-struct CallbackListLockGuard;
-
-impl CallbackListLockGuard {
-    /// Acquires the callback list lock and returns a guard.
-    fn lock() -> Self {
-        while CALLBACK_LIST_LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now();
-        }
-        CallbackListLockGuard
-    }
-}
-
-impl Drop for CallbackListLockGuard {
-    fn drop(&mut self) {
-        CALLBACK_LIST_LOCK.store(false, Ordering::Release);
     }
 }
 
@@ -374,40 +375,11 @@ fn free_callback<T>(ptr: *mut T) {
     }
 }
 
-static THREAD_LIST_LOCK: AtomicBool = AtomicBool::new(false);
-
-/// Guard for the thread list lock.
-/// Automatically releases the lock when dropped.
-struct ThreadListLockGuard;
-
-impl ThreadListLockGuard {
-    /// Acquires the thread list lock and returns a guard.
-    fn lock() -> Self {
-        while THREAD_LIST_LOCK
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
-            .is_err()
-        {
-            std::thread::yield_now(); // Yield to avoid busy waiting
-        }
-        ThreadListLockGuard
-    }
-}
-
-impl Drop for ThreadListLockGuard {
-    fn drop(&mut self) {
-        THREAD_LIST_LOCK.store(false, Ordering::Release);
-    }
-}
-
-static THREAD_LIST_HEAD: AtomicPtr<ThreadData> = AtomicPtr::new(ptr::null_mut());
-
 thread_local! {
     /// Thread-local storage for each thread's ThreadData.
     static THREAD_DATA: &'static ThreadData= {
         // Allocate a new ThreadData instance.
         let td = Box::leak(Box::new(ThreadData::new()));
-        // Register the thread's ThreadData in the global thread list.
-        register_thread(&td);
         td
     };
 }
@@ -428,7 +400,7 @@ thread_local! {
 /// The structure is allocated once per thread and lives for the entire thread lifetime.
 /// It is managed through thread-local storage and a global linked list for writer
 /// threads to traverse when checking for quiescent states.
-struct ThreadData {
+pub struct ThreadData {
     /// Pointer to the next ThreadData in the global list.
     next: AtomicPtr<ThreadData>,
     /// Tracks the thread's local view of the global counter.
@@ -448,40 +420,25 @@ impl ThreadData {
     }
 }
 
-/// Registers a thread to participate in RCU operations
-///
-/// # Safety
-///
-/// This function is safe to call multiple times but will only register a thread once.
-/// The ThreadData structure must have static lifetime as it will be accessed by other threads.
-fn register_thread(td: &ThreadData) {
-    let td_ptr: *mut ThreadData = td as *const _ as *mut ThreadData;
-
-    let _guard = ThreadListLockGuard::lock();
-    td.active.store(true, Ordering::Release);
-    let head = THREAD_LIST_HEAD.load(Ordering::Acquire);
-    td.next.store(head, Ordering::Relaxed);
-    THREAD_LIST_HEAD.store(td_ptr, Ordering::Release);
-}
-
-/// Unregisters a thread from participating in RCU operations
-///
-/// This function is called when a thread's ThreadData is dropped.
-fn unregister_thread(td: &ThreadData) {
-    td.active.store(false, Ordering::Release);
+pub fn get_current_thread_data() -> &'static ThreadData {
+    THREAD_DATA.with(|td| *td)
 }
 
 pub fn drop_thread_data() {
     THREAD_DATA.with(|td| {
-        unregister_thread(&td);
+        td.active.store(false, Ordering::Release);
     });
 }
 
 #[macro_export]
 macro_rules! rcu_thread_spawn {
-    ($($body:tt)*) => {
+    ($rcu_clone:expr, $($body:tt)*) => {
         std::thread::spawn(move || {
-            let result = { $($body)* };
+        let td = read_copy_update::get_current_thread_data();
+                $rcu_clone.register_thread(&td);
+            let result = {
+                $($body)*
+            };
             read_copy_update::drop_thread_data();
             result
         })

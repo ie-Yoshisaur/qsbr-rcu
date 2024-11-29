@@ -32,7 +32,7 @@ fn test_rcu_multithreaded_update_and_callback() {
     // Update threads
     for _ in 0..num_threads {
         let rcu_clone = Arc::clone(&rcu);
-        let handle = rcu_thread_spawn!({
+        let handle = rcu_thread_spawn!(rcu_clone, {
             for _ in 0..increments_per_thread {
                 increment_rcu_value(&rcu_clone);
             }
@@ -44,7 +44,7 @@ fn test_rcu_multithreaded_update_and_callback() {
     // Read threads
     for _ in 0..num_threads {
         let rcu_clone = Arc::clone(&rcu);
-        let handle = rcu_thread_spawn!({
+        let handle = rcu_thread_spawn!(rcu_clone, {
             simulate_read(&rcu_clone, read_iterations);
             rcu_clone.rcu_quiescent_state();
         });
@@ -166,7 +166,7 @@ fn test_rcu_no_memory_leak() {
         let rcu_clone = Arc::clone(&rcu);
         let alloc_count_clone = Arc::clone(&alloc_count);
 
-        let handle = rcu_thread_spawn!({
+        let handle = rcu_thread_spawn!(rcu_clone, {
             for _ in 0..updates_per_thread {
                 rcu_clone
                     .write(|data| {

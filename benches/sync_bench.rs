@@ -79,7 +79,7 @@ fn benchmark(c: &mut Criterion) {
 
                 for _ in 0..NUM_THREADS {
                     let rcu_clone = Arc::clone(&rcu);
-                    let handle = rcu_thread_spawn!({
+                    let handle = rcu_thread_spawn!(rcu_clone, {
                         let mut rng = rand::thread_rng();
                         for _ in 0..NUM_OPERATIONS {
                             let op: usize = rng.gen_range(0..100);
