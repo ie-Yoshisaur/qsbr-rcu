@@ -1,3 +1,3 @@
 mod rcu;
 
-pub use rcu::{drop_thread_data, get_current_thread_data, Rcu};
+pub use rcu::{drop_thread_data, Rcu, ThreadData};
