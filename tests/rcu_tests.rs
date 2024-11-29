@@ -9,7 +9,7 @@ use std::time::Duration;
 /// Increment the value stored in the RCU instance.
 /// Uses `try_update` to safely perform the update.
 fn increment_rcu_value(rcu: &Rcu<i32>) {
-    rcu.try_update(|current| current + 1).unwrap();
+    rcu.write(|current| current + 1).unwrap();
 }
 
 /// Simulate a heavy read workload.
@@ -36,6 +36,7 @@ fn test_rcu_multithreaded_update_and_callback() {
             for _ in 0..increments_per_thread {
                 increment_rcu_value(&rcu_clone);
             }
+            rcu_clone.rcu_quiescent_state();
         });
         handles.push(handle);
     }
@@ -45,6 +46,7 @@ fn test_rcu_multithreaded_update_and_callback() {
         let rcu_clone = Arc::clone(&rcu);
         let handle = rcu_thread_spawn!({
             simulate_read(&rcu_clone, read_iterations);
+            rcu_clone.rcu_quiescent_state();
         });
         handles.push(handle);
     }
@@ -53,8 +55,7 @@ fn test_rcu_multithreaded_update_and_callback() {
         handle.join().unwrap();
     }
 
-    rcu.synchronize_rcu();
-    rcu.process_callbacks();
+    rcu.gc();
 
     let final_value = rcu.read(|d| *d).unwrap();
     assert_eq!(final_value, 42 + num_threads * increments_per_thread);
@@ -71,8 +72,7 @@ fn test_rcu_callback_processing() {
     }
 
     // Ensure all updates are visible and process callbacks.
-    rcu.synchronize_rcu();
-    rcu.process_callbacks();
+    rcu.gc();
 
     // Read and verify the value after callback processing.
     rcu.read(|val| {
@@ -114,7 +114,7 @@ fn test_rcu_garbage_collection() {
 
         // Update the RCU-protected data.
         rcu_clone
-            .try_update(|data| DropCounter {
+            .write(|data| DropCounter {
                 value: data.value + 1,
                 drop_count: Arc::clone(&drop_count_clone),
             })
@@ -122,8 +122,7 @@ fn test_rcu_garbage_collection() {
     }
 
     // Ensure all updates are visible and process callbacks.
-    rcu.synchronize_rcu();
-    rcu.process_callbacks();
+    rcu.gc();
 
     // Allow some time for all callbacks to be processed.
     thread::sleep(Duration::from_millis(1000));
@@ -170,12 +169,13 @@ fn test_rcu_no_memory_leak() {
         let handle = rcu_thread_spawn!({
             for _ in 0..updates_per_thread {
                 rcu_clone
-                    .try_update(|data| {
+                    .write(|data| {
                         alloc_count_clone.fetch_add(1, Ordering::SeqCst);
                         data + 1
                     })
                     .unwrap();
             }
+            rcu_clone.rcu_quiescent_state();
         });
         handles.push(handle);
     }
@@ -187,8 +187,7 @@ fn test_rcu_no_memory_leak() {
 
     rcu.read(|_| {}).unwrap();
     // Ensure all updates are visible and process callbacks.
-    rcu.synchronize_rcu();
-    rcu.process_callbacks();
+    rcu.gc();
 
     // Allow some time for callbacks to be processed.
     thread::sleep(Duration::from_millis(100));

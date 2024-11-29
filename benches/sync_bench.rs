@@ -84,9 +84,7 @@ fn benchmark(c: &mut Criterion) {
                         for _ in 0..NUM_OPERATIONS {
                             let op: usize = rng.gen_range(0..100);
                             if op < write_pct {
-                                rcu_clone
-                                    .try_update(|val| val + 1)
-                                    .expect("RCU update failed");
+                                rcu_clone.write(|val| val + 1).expect("RCU update failed");
                             } else {
                                 rcu_clone
                                     .read(|val| {
@@ -95,6 +93,7 @@ fn benchmark(c: &mut Criterion) {
                                     .expect("RCU read failed");
                             }
                         }
+                        rcu_clone.rcu_quiescent_state();
                     });
                     handles.push(handle);
                 }
@@ -103,8 +102,7 @@ fn benchmark(c: &mut Criterion) {
                     handle.join().unwrap();
                 }
 
-                rcu.synchronize_rcu();
-                rcu.process_callbacks();
+                rcu.gc();
             });
         });
 
