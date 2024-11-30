@@ -653,13 +653,6 @@ pub fn drop_thread_data() {
 ///
 /// - `$rcu_clone`: An expression that evaluates to a cloned reference of the `Rcu` instance.
 /// - `$body`: The body of the thread, provided as a block of code.
-///
-/// # Example
-///
-/// ```rust
-/// rcu_thread_spawn!(rcu.clone(), {
-///     // Thread body
-/// });
 /// ```
 #[macro_export]
 macro_rules! rcu_thread_spawn {
