@@ -1,5 +1,5 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use read_copy_update::{rcu_thread_spawn, Rcu};
+use qsbr_rcu::{rcu_thread_spawn, Rcu};
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 

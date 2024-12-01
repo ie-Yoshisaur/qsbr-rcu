@@ -1,4 +1,4 @@
-use read_copy_update::{rcu_thread_spawn, Rcu};
+use qsbr_rcu::{rcu_thread_spawn, Rcu};
 use std::sync::{
     atomic::{AtomicUsize, Ordering},
     Arc,

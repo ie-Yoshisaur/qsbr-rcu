@@ -1,5 +1,5 @@
 [package]
-name = "read-copy-update"
+name = "qsbr-rcu"
 version = "0.1.0"
 edition = "2021"
 authors = ["Yoshiaki Sano yoshiaki.sano.personal@gmail.com"]

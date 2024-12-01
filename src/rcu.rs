@@ -655,9 +655,10 @@ pub fn drop_thread_data() {
 macro_rules! rcu_thread_spawn {
     ($rcu_clone:expr, $($body:tt)*) => {
         std::thread::spawn(move || {
-            $rcu_clone.register_thread(); // Register the thread with the RCU instance.
+            $rcu_clone.register_thread();
             let result = { $($body)* };
-            $rcu_clone.unregister_thread(); // Unregister the thread before exiting.
+            $rcu_clone.rcu_quiescent_state();
+            $rcu_clone.unregister_thread();
             result
         })
     };
