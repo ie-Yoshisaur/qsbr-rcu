@@ -22,6 +22,8 @@ pub struct Rcu<T> {
     callback_list_lock: AtomicBool,
     /// Lock for synchronizing access to the thread list.
     thread_list_lock: AtomicBool,
+    /// Lock for synchronizing RCU operations.
+    sync_lock: AtomicBool,
     /// Unique identifier for the RCU instance.
     rcu_id: usize,
 }
@@ -41,13 +43,14 @@ impl<T> Rcu<T> {
     /// - `data`: The initial data to be managed by RCU.
     pub fn new(data: T) -> Self {
         let boxed = Box::new(data);
-        let rcu_id = GLOBAL_RCU_ID.fetch_add(1, Ordering::Relaxed); // Relaxed ordering is sufficient for ID generation.
+        let rcu_id = GLOBAL_RCU_ID.fetch_add(1, Ordering::Relaxed);
         let rcu = Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
             global_counter: AtomicUsize::new(1),
             callback_list_lock: AtomicBool::new(false),
             thread_list_lock: AtomicBool::new(false),
+            sync_lock: AtomicBool::new(false),
             thread_list_head: AtomicPtr::new(ptr::null_mut()),
             rcu_id,
         };
@@ -91,14 +94,14 @@ impl<T> Rcu<T> {
     /// It should be called before accessing RCU-protected data.
     fn rcu_read_lock(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
-            let mut current = tls_head.load(Ordering::Acquire); // Acquire ordering to synchronize with potential releases.
+            let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
                 let tls = unsafe { &*current };
                 if tls.rcu_id == self.rcu_id {
                     let thread_data = unsafe { &*tls.thread_data };
                     thread_data.local_counter.store(
-                        self.global_counter.load(Ordering::Acquire), // Acquire to ensure latest counter is read.
-                        Ordering::Release, // Release ensures that subsequent reads are not reordered before this store.
+                        self.global_counter.load(Ordering::Acquire),
+                        Ordering::Release,
                     );
                     break;
                 }
@@ -121,7 +124,7 @@ impl<T> Rcu<T> {
     ///
     /// - A raw pointer to the current data.
     fn rcu_dereference(&self) -> *mut T {
-        let ptr = self.ptr.load(Ordering::Acquire); // Acquire to ensure subsequent reads see the updated data.
+        let ptr = self.ptr.load(Ordering::Acquire);
         ptr
     }
 
@@ -143,7 +146,7 @@ impl<T> Rcu<T> {
         F: Fn(&T) -> T,
     {
         loop {
-            let old_ptr = self.ptr.load(Ordering::Acquire); // Acquire to ensure we have the latest pointer.
+            let old_ptr = self.ptr.load(Ordering::Acquire);
             if old_ptr.is_null() {
                 return Err(());
             }
@@ -153,7 +156,7 @@ impl<T> Rcu<T> {
 
             match self
                 .ptr
-                .compare_exchange(old_ptr, new_ptr, Ordering::Release, Ordering::Acquire) // Release to ensure all writes to new data are visible before the pointer update.
+                .compare_exchange(old_ptr, new_ptr, Ordering::Release, Ordering::Acquire)
             {
                 Ok(_) => {
                     self.add_callback(free_callback, old_ptr);
@@ -179,14 +182,13 @@ impl<T> Rcu<T> {
             next: AtomicPtr::new(ptr::null_mut()),
         });
         let cb_ptr = Box::into_raw(cb);
-
-        self.lock_callback_list(); // Acquire lock to modify the callback list.
+        self.lock_callback_list();
         unsafe {
-            let head = self.callbacks.load(Ordering::Acquire); // Acquire to get the current head.
-            (*cb_ptr).next.store(head, Ordering::Relaxed); // Relaxed as ordering is controlled by the lock.
-            self.callbacks.store(cb_ptr, Ordering::Release); // Release to publish the new head.
+            let head = self.callbacks.load(Ordering::Acquire);
+            (*cb_ptr).next.store(head, Ordering::Relaxed);
+            self.callbacks.store(cb_ptr, Ordering::Release);
         }
-        self.unlock_callback_list(); // Release the lock.
+        self.unlock_callback_list();
     }
 
     /// Marks the current thread as having reached a quiescent state.
@@ -195,14 +197,14 @@ impl<T> Rcu<T> {
     /// completed their current read-side critical section and are in a quiescent state.
     pub fn rcu_quiescent_state(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
-            let mut current = tls_head.load(Ordering::Acquire); // Acquire to ensure visibility of thread list.
+            let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
                 let tls = unsafe { &*current };
                 if tls.rcu_id == self.rcu_id {
                     let thread_data = unsafe { &*tls.thread_data };
                     thread_data.local_counter.store(
-                        self.global_counter.load(Ordering::Acquire), // Acquire to read the latest global counter.
-                        Ordering::Release, // Release to ensure the store is visible before any subsequent operations.
+                        self.global_counter.load(Ordering::Acquire),
+                        Ordering::Release,
                     );
                     break;
                 }
@@ -235,7 +237,7 @@ impl<T> Rcu<T> {
             unsafe {
                 let cb = Box::from_raw(cb_ptr);
                 (cb.func)(cb.data);
-                cb_ptr = cb.next.load(Ordering::Relaxed); // Move to the next callback.
+                cb_ptr = cb.next.load(Ordering::Relaxed);
             }
         }
     }
@@ -255,15 +257,17 @@ impl<T> Rcu<T> {
     ///
     /// - A pointer to the list of safe callbacks to be processed.
     fn synchronize_rcu(&self) -> *mut Callback<T> {
+        self.lock_sync();
+        self.lock_thread_list();
         self.rcu_quiescent_state();
-        let latest_counter = self.global_counter.fetch_add(1, Ordering::AcqRel); // AcqRel to ensure ordering of counter updates.
-        let old_counter = latest_counter;
+        let old_counter = self.global_counter.fetch_add(1, Ordering::AcqRel);
+
+        let old_head = self.callbacks.load(Ordering::Acquire);
 
         loop {
             let mut all_threads_observed = true;
 
             unsafe {
-                self.lock_thread_list(); // Acquire lock to safely iterate over thread list.
                 let mut ptr = self.thread_list_head.load(Ordering::Acquire);
                 while !ptr.is_null() {
                     let thread_data = &*ptr;
@@ -272,14 +276,13 @@ impl<T> Rcu<T> {
                         continue;
                     }
 
-                    let local_counter = thread_data.local_counter.load(Ordering::Acquire); // Acquire to read the latest local counter.
+                    let local_counter = thread_data.local_counter.load(Ordering::Acquire);
                     if local_counter < old_counter {
                         all_threads_observed = false;
                         break;
                     }
                     ptr = thread_data.next.load(Ordering::Acquire);
                 }
-                self.unlock_thread_list(); // Release the lock.
             }
 
             if all_threads_observed {
@@ -289,10 +292,104 @@ impl<T> Rcu<T> {
             }
         }
 
-        self.lock_callback_list(); // Acquire lock to safely swap the callback list.
-        let safe_callback_list = self.callbacks.swap(ptr::null_mut(), Ordering::Acquire); // Acquire to ensure visibility of the swapped list.
-        self.unlock_callback_list(); // Release the lock.
+        self.unlock_thread_list();
+        self.unlock_sync();
+
+        self.lock_callback_list();
+
+        let current_head = self.callbacks.load(Ordering::Acquire);
+
+        if old_head.is_null() {
+            return ptr::null_mut();
+        }
+
+        if old_head == current_head {
+            let safe_callback_list = self.callbacks.swap(ptr::null_mut(), Ordering::Acquire);
+            return safe_callback_list;
+        }
+
+        let mut prev_ptr = current_head;
+        let mut found = false;
+        unsafe {
+            while !prev_ptr.is_null() {
+                let cb = &*prev_ptr;
+                let next_ptr = cb.next.load(Ordering::Acquire);
+                if next_ptr == old_head {
+                    cb.next.store(ptr::null_mut(), Ordering::Release);
+                    found = true;
+                    break;
+                }
+                prev_ptr = next_ptr;
+            }
+        }
+
+        self.unlock_callback_list();
+
+        let safe_callback_list = if found { old_head } else { ptr::null_mut() };
         safe_callback_list
+    }
+
+    fn lock_callback_list(&self) {
+        loop {
+            let is_locked = self.callback_list_lock.load(Ordering::Acquire);
+            if !is_locked {
+                if self
+                    .callback_list_lock
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+
+    fn unlock_callback_list(&self) {
+        self.callback_list_lock.store(false, Ordering::Release);
+    }
+
+    fn lock_thread_list(&self) {
+        loop {
+            let is_locked = self.thread_list_lock.load(Ordering::Acquire);
+            if !is_locked {
+                if self
+                    .thread_list_lock
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+
+    fn unlock_thread_list(&self) {
+        self.thread_list_lock.store(false, Ordering::Release);
+    }
+
+    fn lock_sync(&self) {
+        loop {
+            let is_locked = self.sync_lock.load(Ordering::Acquire);
+            if !is_locked {
+                if self
+                    .sync_lock
+                    .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+                    .is_ok()
+                {
+                    break;
+                }
+            } else {
+                thread::yield_now();
+            }
+        }
+    }
+
+    fn unlock_sync(&self) {
+        self.sync_lock.store(false, Ordering::Release);
     }
 
     /// Registers the current thread to participate in RCU operations.
@@ -306,7 +403,7 @@ impl<T> Rcu<T> {
     /// - This function is safe to call multiple times but will only register a thread once per RCU instance.
     pub fn register_thread(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
-            let mut current = tls_head.load(Ordering::Acquire); // Acquire to traverse the TLS list.
+            let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
                 let tls = unsafe { &*current };
                 if tls.rcu_id == self.rcu_id {
@@ -324,10 +421,10 @@ impl<T> Rcu<T> {
             loop {
                 let head = tls_head.load(Ordering::Acquire);
                 unsafe {
-                    (*new_tls_ptr).next.store(head, Ordering::Relaxed); // Relaxed as ordering is managed by the lock.
+                    (*new_tls_ptr).next.store(head, Ordering::Relaxed);
                 }
                 if tls_head
-                    .compare_exchange(head, new_tls_ptr, Ordering::AcqRel, Ordering::Acquire) // AcqRel to ensure proper ordering.
+                    .compare_exchange(head, new_tls_ptr, Ordering::AcqRel, Ordering::Acquire)
                     .is_ok()
                 {
                     break;
@@ -339,17 +436,17 @@ impl<T> Rcu<T> {
                 (*new_thread_data_ptr).tls_ptr = new_tls_ptr;
             }
 
-            self.lock_thread_list(); // Acquire lock to modify the thread list.
+            self.lock_thread_list();
             unsafe {
                 (*new_thread_data_ptr).next.store(
                     self.thread_list_head.load(Ordering::Acquire),
-                    Ordering::Relaxed, // Relaxed as ordering is controlled by the lock.
+                    Ordering::Relaxed,
                 );
                 self.thread_list_head
-                    .store(new_thread_data_ptr, Ordering::Release); // Release to publish the new head.
-                (*new_thread_data_ptr).active.store(true, Ordering::Release); // Release to make the thread active.
+                    .store(new_thread_data_ptr, Ordering::Release);
+                (*new_thread_data_ptr).active.store(true, Ordering::Release);
             }
-            self.unlock_thread_list(); // Release the lock.
+            self.unlock_thread_list();
         });
     }
 
@@ -359,12 +456,12 @@ impl<T> Rcu<T> {
     /// typically when the thread is about to exit.
     pub fn unregister_thread(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
-            let mut current = tls_head.load(Ordering::Acquire); // Acquire to traverse the TLS list.
+            let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
                 let tls = unsafe { &*current };
                 if tls.rcu_id == self.rcu_id {
                     unsafe {
-                        (*tls.thread_data).active.store(false, Ordering::Release); // Release to mark the thread as inactive.
+                        (*tls.thread_data).active.store(false, Ordering::Release);
                         remove_thread_local_storage(tls_head, tls);
                         drop(Box::from_raw(current));
                     }
@@ -381,10 +478,10 @@ impl<T> Rcu<T> {
     /// no longer active. It helps prevent memory leaks by ensuring that `ThreadData` structures
     /// for terminated threads are properly deallocated.
     fn clean_thread_list(&self) {
+        self.lock_thread_list();
         let mut prev_ptr = &self.thread_list_head as *const _ as *mut AtomicPtr<ThreadData>;
         let mut current_ptr = self.thread_list_head.load(Ordering::Acquire);
 
-        self.lock_thread_list(); // Acquire lock to safely modify the thread list.
         while !current_ptr.is_null() {
             let thread_data = unsafe { &*current_ptr };
             if !thread_data.active.load(Ordering::Acquire) {
@@ -400,39 +497,7 @@ impl<T> Rcu<T> {
                 current_ptr = thread_data.next.load(Ordering::Acquire);
             }
         }
-        self.unlock_thread_list(); // Release the lock.
-    }
-
-    /// Acquires a lock on the thread list to ensure exclusive access.
-    fn lock_thread_list(&self) {
-        while self
-            .thread_list_lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) // Acquire ordering to ensure subsequent operations see the lock.
-            .is_err()
-        {
-            thread::yield_now(); // Yield to prevent busy waiting.
-        }
-    }
-
-    /// Releases the lock on the thread list.
-    fn unlock_thread_list(&self) {
-        self.thread_list_lock.store(false, Ordering::Release); // Release to allow other threads to acquire the lock.
-    }
-
-    /// Acquires a lock on the callback list to ensure exclusive access.
-    fn lock_callback_list(&self) {
-        while self
-            .callback_list_lock
-            .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed) // Acquire ordering to ensure subsequent operations see the lock.
-            .is_err()
-        {
-            thread::yield_now(); // Yield to prevent busy waiting.
-        }
-    }
-
-    /// Releases the lock on the callback list.
-    fn unlock_callback_list(&self) {
-        self.callback_list_lock.store(false, Ordering::Release); // Release to allow other threads to acquire the lock.
+        self.unlock_thread_list();
     }
 }
 
@@ -440,19 +505,18 @@ impl<T> Drop for Rcu<T> {
     fn drop(&mut self) {
         self.gc();
 
-        let ptr = self.ptr.swap(ptr::null_mut(), Ordering::Release); // Release to ensure all previous writes are visible.
+        let ptr = self.ptr.swap(ptr::null_mut(), Ordering::Release);
         if !ptr.is_null() {
             unsafe {
                 drop(Box::from_raw(ptr)); // Drop the data to free memory.
             }
         }
 
-        let mut current = self.thread_list_head.load(Ordering::Acquire); // Acquire to traverse the thread list.
+        let mut current = self.thread_list_head.load(Ordering::Acquire);
         while !current.is_null() {
             let thread_data = unsafe { &*current };
-            // Mark the thread as inactive
-            thread_data.active.store(false, Ordering::Release); // Release to mark the thread as inactive.
-                                                                // Remove the corresponding ThreadLocalStorage
+
+            // Remove the corresponding ThreadLocalStorage
             if !thread_data.tls_ptr.is_null() {
                 unsafe {
                     let tls = &mut *thread_data.tls_ptr;
@@ -462,7 +526,7 @@ impl<T> Drop for Rcu<T> {
                     drop(Box::from_raw(thread_data.tls_ptr));
                 }
             }
-            let next = thread_data.next.load(Ordering::Acquire); // Acquire to read the next pointer.
+            let next = thread_data.next.load(Ordering::Acquire);
             unsafe {
                 drop(Box::from_raw(current));
             }
@@ -590,7 +654,7 @@ impl ThreadData {
 ///
 /// - A raw pointer to the head of the thread's `ThreadLocalStorage` linked list.
 pub fn get_current_thread_storage() -> *mut ThreadLocalStorage {
-    THREAD_LOCAL_STORAGE.with(|tls_head| tls_head.load(Ordering::Acquire)) // Acquire to ensure visibility.
+    THREAD_LOCAL_STORAGE.with(|tls_head| tls_head.load(Ordering::Acquire))
 }
 
 /// Removes a specific `ThreadLocalStorage` from the thread's `THREAD_LOCAL_STORAGE` linked list.
@@ -603,7 +667,7 @@ fn remove_thread_local_storage(
     tls_head: &AtomicPtr<ThreadLocalStorage>,
     tls_to_remove: &ThreadLocalStorage,
 ) {
-    let mut current = tls_head.load(Ordering::Acquire); // Acquire to traverse the TLS list.
+    let mut current = tls_head.load(Ordering::Acquire);
     let mut prev: *mut AtomicPtr<ThreadLocalStorage> =
         tls_head as *const _ as *mut AtomicPtr<ThreadLocalStorage>; // Pointer to the previous node's next pointer.
 
@@ -613,8 +677,8 @@ fn remove_thread_local_storage(
             && current_ref.thread_data == tls_to_remove.thread_data
         {
             unsafe {
-                let next = current_ref.next.load(Ordering::Acquire); // Acquire to read the next pointer.
-                (*prev).store(next, Ordering::Release); // Release to update the previous node's next pointer.
+                let next = current_ref.next.load(Ordering::Acquire);
+                (*prev).store(next, Ordering::Release);
                 break;
             }
         }
@@ -629,11 +693,11 @@ fn remove_thread_local_storage(
 /// needs to participate in RCU operations. It updates the thread's `active` status accordingly.
 pub fn drop_thread_data() {
     THREAD_LOCAL_STORAGE.with(|tls_head| {
-        let mut current = tls_head.load(Ordering::Acquire); // Acquire to traverse the TLS list.
+        let mut current = tls_head.load(Ordering::Acquire);
         while !current.is_null() {
             let tls = unsafe { &*current };
             unsafe {
-                (*tls.thread_data).active.store(false, Ordering::Release); // Release to mark the thread as inactive.
+                (*tls.thread_data).active.store(false, Ordering::Release);
             }
             current = tls.next.load(Ordering::Acquire);
         }

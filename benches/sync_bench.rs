@@ -102,7 +102,7 @@ fn benchmark(c: &mut Criterion) {
                     handle.join().unwrap();
                 }
 
-                rcu.gc();
+                // rcu.gc();
             });
         });
 
