@@ -305,6 +305,7 @@ impl<T> Rcu<T> {
 
         if old_head == current_head {
             let safe_callback_list = self.callbacks.swap(ptr::null_mut(), Ordering::Acquire);
+            self.unlock_callback_list();
             return safe_callback_list;
         }
 
