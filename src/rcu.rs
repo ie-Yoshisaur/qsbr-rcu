@@ -47,7 +47,7 @@ impl<T> Rcu<T> {
         let rcu = Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
-            global_counter: AtomicUsize::new(0),
+            global_counter: AtomicUsize::new(1),
             callback_list_lock: AtomicBool::new(false),
             thread_list_lock: AtomicBool::new(false),
             sync_lock: AtomicBool::new(false),
