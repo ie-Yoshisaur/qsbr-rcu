@@ -722,7 +722,6 @@ macro_rules! rcu_thread_spawn {
         std::thread::spawn(move || {
             $rcu_clone.register_thread();
             let result = { $($body)* };
-            $rcu_clone.rcu_quiescent_state();
             $rcu_clone.unregister_thread();
             result
         })
