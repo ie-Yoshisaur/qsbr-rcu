@@ -29,7 +29,7 @@ pub struct Rcu<T> {
 }
 
 /// Global RCU ID counter to assign unique IDs to each RCU instance.
-static GLOBAL_RCU_ID: AtomicUsize = AtomicUsize::new(1); // AtomicUsize for thread-safe ID generation.
+static GLOBAL_RCU_ID: AtomicUsize = AtomicUsize::new(0); // AtomicUsize for thread-safe ID generation.
 
 impl<T> Rcu<T> {
     /// Creates a new RCU instance by allocating the provided data on the heap.
@@ -47,7 +47,7 @@ impl<T> Rcu<T> {
         let rcu = Rcu {
             ptr: AtomicPtr::new(Box::into_raw(boxed)),
             callbacks: AtomicPtr::new(ptr::null_mut()),
-            global_counter: AtomicUsize::new(1),
+            global_counter: AtomicUsize::new(0),
             callback_list_lock: AtomicBool::new(false),
             thread_list_lock: AtomicBool::new(false),
             sync_lock: AtomicBool::new(false),
