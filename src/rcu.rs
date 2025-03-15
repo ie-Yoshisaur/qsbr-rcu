@@ -303,6 +303,7 @@ impl<T> Rcu<T> {
         let current_head = self.callbacks.load(Ordering::Acquire);
 
         if old_head.is_null() {
+            self.unlock_callback_list();
             return ptr::null_mut();
         }
 
