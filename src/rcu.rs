@@ -1,6 +1,9 @@
 use std::ptr;
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering};
-use std::thread;
+use std::sync::{
+    atomic::{AtomicBool, AtomicPtr, AtomicUsize, Ordering},
+    Arc,
+};
+use std::thread::{self, JoinHandle};
 
 /// A synchronization structure based on Read-Copy-Update (RCU).
 ///
@@ -402,7 +405,7 @@ impl<T> Rcu<T> {
     ///
     /// - The `ThreadData` reference must remain valid for the lifetime of the thread.
     /// - This function is safe to call multiple times but will only register a thread once per RCU instance.
-    pub fn register_thread(&self) {
+    fn register_thread(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
             let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
@@ -455,7 +458,7 @@ impl<T> Rcu<T> {
     ///
     /// This function should be called when a thread no longer needs to participate in RCU operations,
     /// typically when the thread is about to exit.
-    pub fn unregister_thread(&self) {
+    fn unregister_thread(&self) {
         THREAD_LOCAL_STORAGE.with(|tls_head| {
             let mut current = tls_head.load(Ordering::Acquire);
             while !current.is_null() {
@@ -584,7 +587,7 @@ thread_local! {
 ///
 /// Each `ThreadLocalStorage` contains its own `ThreadData`, a unique `rcu_id`, and a pointer to the next
 /// `ThreadLocalStorage` in the thread's linked list.
-pub struct ThreadLocalStorage {
+struct ThreadLocalStorage {
     /// Pointer to the thread's `ThreadData`.
     thread_data: *mut ThreadData, // Raw pointer to ThreadData.
     /// Unique identifier for the RCU instance.
@@ -621,7 +624,7 @@ impl ThreadLocalStorage {
 /// * `active` - Indicates whether the thread is currently active in RCU operations.
 /// * `next` - Pointer to the next `ThreadData` in the Rcu's thread list.
 /// * `tls_ptr` - Pointer to the corresponding `ThreadLocalStorage`.
-pub struct ThreadData {
+struct ThreadData {
     /// Tracks the thread's local view of the global counter.
     local_counter: AtomicUsize, // AtomicUsize for atomic updates of the local counter.
     /// Indicates whether the thread is active or not.
@@ -644,18 +647,6 @@ impl ThreadData {
             tls_ptr: ptr::null_mut(),           // Initialize TLS pointer as null.
         }
     }
-}
-
-/// Retrieves the current thread's `ThreadLocalStorage`.
-///
-/// This function provides access to the thread-local `ThreadLocalStorage` linked list, which is
-/// used internally by the RCU implementation to track the thread's state for multiple RCU instances.
-///
-/// # Returns
-///
-/// - A raw pointer to the head of the thread's `ThreadLocalStorage` linked list.
-pub fn get_current_thread_storage() -> *mut ThreadLocalStorage {
-    THREAD_LOCAL_STORAGE.with(|tls_head| tls_head.load(Ordering::Acquire))
 }
 
 /// Removes a specific `ThreadLocalStorage` from the thread's `THREAD_LOCAL_STORAGE` linked list.
@@ -688,23 +679,6 @@ fn remove_thread_local_storage(
     }
 }
 
-/// Marks the current thread as no longer participating in RCU operations.
-///
-/// This function should be called when a thread is about to terminate or when it no longer
-/// needs to participate in RCU operations. It updates the thread's `active` status accordingly.
-pub fn drop_thread_data() {
-    THREAD_LOCAL_STORAGE.with(|tls_head| {
-        let mut current = tls_head.load(Ordering::Acquire);
-        while !current.is_null() {
-            let tls = unsafe { &*current };
-            unsafe {
-                (*tls.thread_data).active.store(false, Ordering::Release);
-            }
-            current = tls.next.load(Ordering::Acquire);
-        }
-    });
-}
-
 /// A macro for spawning a new thread that automatically registers and unregisters its
 /// `ThreadLocalStorage` with the provided `Rcu` instance.
 ///
@@ -716,14 +690,16 @@ pub fn drop_thread_data() {
 /// - `$rcu_clone`: An expression that evaluates to a cloned reference of the `Rcu` instance.
 /// - `$body`: The body of the thread, provided as a block of code.
 /// ```
-#[macro_export]
-macro_rules! rcu_thread_spawn {
-    ($rcu_clone:expr, $($body:tt)*) => {
-        std::thread::spawn(move || {
-            $rcu_clone.register_thread();
-            let result = { $($body)* };
-            $rcu_clone.unregister_thread();
-            result
-        })
-    };
+pub fn rcu_thread_spawn<T, F, R>(rcu: Arc<Rcu<T>>, f: F) -> JoinHandle<R>
+where
+    F: FnOnce() -> R + Send + 'static,
+    R: Send + 'static,
+    T: 'static,
+{
+    thread::spawn(move || {
+        rcu.register_thread();
+        let result = f();
+        rcu.unregister_thread();
+        result
+    })
 }

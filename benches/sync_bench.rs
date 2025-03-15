@@ -1,5 +1,6 @@
 use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
-use qsbr_rcu::{rcu_thread_spawn, Rcu};
+use qsbr_rcu::rcu_thread_spawn;
+use qsbr_rcu::Rcu;
 use std::sync::{Arc, Mutex, RwLock};
 use std::thread;
 
@@ -79,7 +80,7 @@ fn benchmark(c: &mut Criterion) {
 
                 for _ in 0..NUM_THREADS {
                     let rcu_clone = Arc::clone(&rcu);
-                    let handle = rcu_thread_spawn!(rcu_clone, {
+                    let handle = rcu_thread_spawn(rcu_clone.clone(), move || {
                         let mut rng = rand::thread_rng();
                         for _ in 0..NUM_OPERATIONS {
                             let op: usize = rng.gen_range(0..100);
@@ -102,7 +103,7 @@ fn benchmark(c: &mut Criterion) {
                     handle.join().unwrap();
                 }
 
-                // rcu.gc();
+                rcu.gc();
             });
         });
 
