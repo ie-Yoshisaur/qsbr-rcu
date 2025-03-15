@@ -680,17 +680,24 @@ fn remove_thread_local_storage(
     }
 }
 
-/// A macro for spawning a new thread that automatically registers and unregisters its
-/// `ThreadLocalStorage` with the provided `Rcu` instance.
+/// Spawns a new thread that automatically registers and unregisters its
+/// ThreadLocalStorage with the provided Rcu instance.
 ///
-/// This macro ensures that the thread participates in RCU operations by registering its
-/// `ThreadLocalStorage` upon creation and unregistering it before termination.
+/// This function ensures that the spawned thread participates in RCU operations
+/// by registering its ThreadLocalStorage at the start of the thread and unregistering
+/// it before the thread terminates.
 ///
 /// # Parameters
 ///
-/// - `$rcu_clone`: An expression that evaluates to a cloned reference of the `Rcu` instance.
-/// - `$body`: The body of the thread, provided as a block of code.
-/// ```
+/// - `rcu`: An `Arc` pointer to an `Rcu<T>` instance. This enables sharing the
+///   RCU instance safely among multiple threads.
+/// - `f`: A closure representing the body of the thread. This closure contains
+///   the operations to be executed in the new thread.
+///
+/// # Returns
+///
+/// A `JoinHandle` for the spawned thread, which can be used to wait for the thread
+/// to finish and retrieve its result.
 pub fn rcu_thread_spawn<T, F, R>(rcu: Arc<Rcu<T>>, f: F) -> JoinHandle<R>
 where
     F: FnOnce() -> R + Send + 'static,
