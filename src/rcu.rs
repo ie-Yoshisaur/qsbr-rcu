@@ -262,10 +262,11 @@ impl<T> Rcu<T> {
     fn synchronize_rcu(&self) -> *mut Callback<T> {
         self.lock_sync();
         self.lock_thread_list();
-        self.rcu_quiescent_state();
-        let old_counter = self.global_counter.fetch_add(1, Ordering::AcqRel);
 
+        let old_counter = self.global_counter.fetch_add(1, Ordering::AcqRel);
         let old_head = self.callbacks.load(Ordering::Acquire);
+
+        self.rcu_quiescent_state();
 
         loop {
             let mut all_threads_observed = true;
@@ -280,7 +281,7 @@ impl<T> Rcu<T> {
                     }
 
                     let local_counter = thread_data.local_counter.load(Ordering::Acquire);
-                    if local_counter < old_counter {
+                    if local_counter <= old_counter {
                         all_threads_observed = false;
                         break;
                     }
